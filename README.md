@@ -2,7 +2,7 @@
 
 Experimental orchestration for the FWS (Fractal Weight Spaces) programme. Houses the z-space vs W-space paired training harness, the regime switcher (joint / alternating / meta), the `optax.multi_transform` G/z partition setup, and the activation + renderer + per-group-optimiser ablation runners.
 
-Not a renderer. Not a library of primitives. fws-bench is the *experimental layer* — it consumes sibling FWS libraries ([`loom`](https://github.com/DarkbyteAT/loom), [`ondes`](https://github.com/DarkbyteAT/ondes), [`jacobian-spec`](https://github.com/DarkbyteAT/jacobian-spec), [`landscape-archaeology`](https://github.com/DarkbyteAT/landscape-archaeology)) and orchestrates the experiments that compare W-direct training to W = render(G, z) reparameterised training under matched compute.
+Not a renderer. Not a library of primitives. fws-bench is the *experimental layer* — it consumes sibling FWS libraries ([`loom`](https://github.com/DarkbyteAT/loom), [`ondes`](https://github.com/DarkbyteAT/ondes), [`landscape-archaeology`](https://github.com/DarkbyteAT/landscape-archaeology)) and orchestrates the experiments that compare W-direct training to W = render(G, z) reparameterised training under matched compute. Jacobian and Hessian spectra are both diagnostic responsibilities of `landscape-archaeology`.
 
 See [`docs/PHILOSOPHY.md`](docs/PHILOSOPHY.md) for the design rationale, the paired-arm contract, and the regime taxonomy.
 
@@ -23,7 +23,7 @@ results["w_arm"]     # curves + diagnostics for direct W arm
 
 ## Status
 
-**v0.0.0 — scaffold only.** The public surface above is a placeholder that raises `NotImplementedError`. Sibling dependencies (`jacobian-spec`, `landscape-archaeology`, `ondes`, `loom`) are unpublished, so `uv sync` will fail until either the siblings ship or `tool.uv.sources` is wired up locally — see `pyproject.toml` for the co-development pattern.
+**v0.0.0 — scaffold only.** The public surface above is a placeholder that raises `NotImplementedError`. Sibling dependencies (`landscape-archaeology`, `ondes`, `loom`) are unpublished, so `uv sync` will fail until either the siblings ship or `tool.uv.sources` is wired up locally — see `pyproject.toml` for the co-development pattern.
 
 The first real cell — paired training across a single `(regime, optimiser, mainnet-activation)` point — lands as the Trello board's *First z-space vs W-space paired-training prototype* card.
 

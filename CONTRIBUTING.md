@@ -8,7 +8,7 @@ cd fws-bench
 uv sync --group dev
 ```
 
-The sibling dependencies (`jacobian-spec`, `landscape-archaeology`, `ondes`, `loom`) are not yet on PyPI. For local co-development, enable the `[tool.uv.sources]` block in `pyproject.toml` pointing at sibling checkouts under `../`.
+The sibling dependencies (`landscape-archaeology`, `ondes`, `loom`) are not yet on PyPI. For local co-development, enable the `[tool.uv.sources]` block in `pyproject.toml` pointing at sibling checkouts under `../`.
 
 ## Code Conventions
 

@@ -18,11 +18,11 @@ Everything upstream of orchestration — INR primitives, the re-parameterisation
 fws-bench  (this repo)
   ├── loom                  — render(P, f, params) substrate
   ├── ondes                 — INR primitives (SIREN, WIRE, Fourier encodings)
-  ├── jacobian-spec         — Jacobian-based spectral diagnostics
-  └── landscape-archaeology — loss-landscape probes (sharpness, basin shape)
+  └── landscape-archaeology — Jacobian + Hessian spectral diagnostics
+                              and loss-landscape probes (sharpness, basin shape)
 ```
 
-Each sibling owns one thing. fws-bench owns *the experiment that uses all four*.
+Each sibling owns one thing. fws-bench owns *the experiment that uses all three*.
 
 ## The paired-arm contract
 
@@ -35,7 +35,7 @@ Every cell run by fws-bench answers this question for one point in the design sp
 1. **Same task.** Both arms see the same data, the same task loss, the same evaluation protocol.
 2. **Same compute budget.** Outer-step count, batch size, and gradient accumulation are matched. Wall-clock differences from the renderer's forward pass are reported, not hidden.
 3. **Same initialisation distribution for W.** W-arm starts from `W ~ p_W`. FWS-arm starts from `(G_0, z_0)` such that `render(G_0, z_0) ~ p_W` in distribution. This is a non-trivial calibration step and is part of the harness.
-4. **Same diagnostics.** Both arms feed the same Jacobian-spec and landscape-archaeology probes at the same checkpoints.
+4. **Same diagnostics.** Both arms feed the same landscape-archaeology probes (Jacobian spectra, Hessian spectra, sharpness, basin shape) at the same checkpoints.
 
 A result is reported as a pair: `(loss_fws_arm, loss_w_arm)`. A single arm without its match is not a result.
 
@@ -86,15 +86,14 @@ Outer loop optimises G; inner loop adapts z per task batch from a prior. This is
 - The matched-compute accounting
 - The initialisation calibration (FWS-arm's `(G_0, z_0)` to match W-arm's `W ~ p_W`)
 - The activation / renderer / per-group-optimiser ablation runners
-- The per-checkpoint diagnostic invocation (calling out to jacobian-spec and landscape-archaeology)
+- The per-checkpoint diagnostic invocation (calling out to landscape-archaeology)
 - Run-artefact persistence (the curves + diagnostics dict that `paired_train` returns)
 
 ## What fws-bench does NOT own
 
 - The render substrate — `loom`
 - INR bodies, Fourier encodings, coord grids — `ondes`
-- Jacobian / spectral diagnostics — `jacobian-spec`
-- Loss-landscape probes — `landscape-archaeology`
+- Jacobian / Hessian spectral diagnostics and loss-landscape probes — `landscape-archaeology`
 - Concrete task instances (CIFAR-10, ImageNet patches, etc.) — `examples/` or downstream
 - Plotting and figure generation — downstream notebooks
 - Sweep registries beyond the built-in ablation axes — downstream scripts
@@ -104,7 +103,7 @@ Outer loop optimises G; inner loop adapts z per task batch from a prior. This is
 
 - **Owning the renderer.** `loom` does. fws-bench takes a `render_fn` callable.
 - **Owning the INR.** `ondes` does. fws-bench accepts whatever `render_fn` returns.
-- **Owning the diagnostic.** `jacobian-spec` and `landscape-archaeology` do.
+- **Owning the diagnostic.** `landscape-archaeology` does (Jacobian, Hessian, and landscape probes alike).
 - **Re-implementing optax.** The G/z partition is one call to `optax.multi_transform`; fws-bench wires it, not re-invents it.
 - **Owning task data.** Datasets live in `examples/` or downstream. The harness sees a `task_loss_fn`.
 

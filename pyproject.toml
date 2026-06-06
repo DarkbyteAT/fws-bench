@@ -17,10 +17,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # NOTE: dependency wiring is pending sibling-library publication. The siblings
-# (jacobian-spec, landscape-archaeology, ondes, loom) do not yet have tagged
-# releases on PyPI, so the constraints below are placeholders. `uv sync` will
-# fail until each sibling either publishes or gets wired up via `tool.uv.sources`
-# git sources — see the commented block below for the co-development pattern.
+# (landscape-archaeology, ondes, loom) do not yet have tagged releases on PyPI,
+# so the constraints below are placeholders. `uv sync` will fail until each
+# sibling either publishes or gets wired up via `tool.uv.sources` git sources —
+# see the commented block below for the co-development pattern.
 # We intentionally do not pin versions yet: a v0.0.0 scaffold should not
 # claim compatibility with API surface that does not exist.
 dependencies = [
@@ -31,7 +31,6 @@ dependencies = [
     # Sibling FWS-programme libraries — declared here but commented out until
     # they publish to PyPI or get wired up via `tool.uv.sources` below. The
     # intended dep list, restored once siblings ship:
-    #   "jacobian-spec",
     #   "landscape-archaeology",
     #   "ondes",
     #   "loom",
@@ -39,7 +38,6 @@ dependencies = [
 
 # For local co-development against sibling checkouts, uncomment and adjust:
 # [tool.uv.sources]
-# jacobian-spec = { path = "../jacobian-spec", editable = true }
 # landscape-archaeology = { path = "../landscape-archaeology", editable = true }
 # ondes = { path = "../ondes", editable = true }
 # loom = { path = "../loom", editable = true }
