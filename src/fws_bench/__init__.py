@@ -14,8 +14,9 @@ board's "First z-space vs W-space paired-training prototype" card.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 from jaxtyping import PyTree
 
@@ -53,8 +54,7 @@ def paired_train(
         rendered-weight diagnostics, and final test metrics.
     """
     raise NotImplementedError(
-        "fws-bench v0.0.0 is a scaffold; "
-        "see https://trello.com/b/dYJqhfUV/fws-bench for the first prototype card"
+        "fws-bench v0.0.0 is a scaffold; see https://trello.com/b/dYJqhfUV/fws-bench for the first prototype card"
     )
 
 
