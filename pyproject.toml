@@ -28,17 +28,17 @@ dependencies = [
     "jaxtyping>=0.3.9",
     "optax",
     "optimistix",
-    # Sibling FWS-programme libraries — declared here but commented out until
-    # they publish to PyPI or get wired up via `tool.uv.sources` below. The
-    # intended dep list, restored once siblings ship:
-    #   "landscape-archaeology",
+    "landscape-archaeology",
+    # Sibling FWS-programme libraries — `ondes` and `loom` remain commented
+    # out until they publish to PyPI or get wired up via `tool.uv.sources`
+    # below. Phase 1 examples only need landscape-archaeology.
     #   "ondes",
     #   "loom",
 ]
 
-# For local co-development against sibling checkouts, uncomment and adjust:
-# [tool.uv.sources]
-# landscape-archaeology = { path = "../landscape-archaeology", editable = true }
+[tool.uv.sources]
+landscape-archaeology = { path = "../landscape-archaeology", editable = true }
+# For full co-development against sibling checkouts, uncomment and adjust:
 # ondes = { path = "../ondes", editable = true }
 # loom = { path = "../loom", editable = true }
 # Once the siblings ship on PyPI or have stable git tags, switch to git sources:

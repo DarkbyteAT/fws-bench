@@ -27,3 +27,7 @@ convention = "google"
 # jaxtyping uses string annotations (e.g. `Float[Array, ""]`) for shape specs;
 # F722/F821 mis-flag these as syntax errors / undefined names.
 "src/**" = ["F722", "F821"]
+# Same jaxtyping concession for runnable examples; examples don't need full
+# pydocstyle compliance either — they're scripts, not library surface.
+# E501 ignored because example scripts often embed long markdown literals.
+"examples/**" = ["F722", "F821", "D", "E501"]
