@@ -24,3 +24,6 @@ convention = "google"
 # Test functions are self-documenting through Given-When-Then structure and
 # descriptive test names; D rules don't add value here.
 "tests/**" = ["D"]
+# jaxtyping uses string annotations (e.g. `Float[Array, ""]`) for shape specs;
+# F722/F821 mis-flag these as syntax errors / undefined names.
+"src/**" = ["F722", "F821"]

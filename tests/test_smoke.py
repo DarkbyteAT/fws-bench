@@ -1,6 +1,4 @@
-"""Smoke test for the v0.0.0 scaffold public surface."""
-
-from __future__ import annotations
+"""Smoke test for the public surface."""
 
 import pytest
 
@@ -28,12 +26,12 @@ def test_regime_enumerates_joint_alternating_meta():
     assert values == {"joint", "alternating", "meta"}
 
 
-def test_paired_train_raises_not_implemented():
-    # Given: the v0.0.0 scaffold of paired_train
-    # When: we call it with any arguments
-    # Then: it raises NotImplementedError pointing at the Trello prototype card
-    with pytest.raises(NotImplementedError, match="scaffold"):
-        fws_bench.paired_train(
-            render_fn=lambda params: params,
-            task_loss_fn=lambda params, batch: 0.0,
-        )
+def test_package_exposes_train_result_value_types():
+    # Given: the public surface declared in fws_bench/__init__.py
+    # When: we inspect the module's exported names
+    # Then: TrainResult and PairedTrainResult are exposed for downstream
+    # callers that want to type-annotate trajectories
+    assert hasattr(fws_bench, "TrainResult")
+    assert hasattr(fws_bench, "PairedTrainResult")
+    assert "TrainResult" in fws_bench.__all__
+    assert "PairedTrainResult" in fws_bench.__all__
