@@ -1,0 +1,65 @@
+[project]
+name = "fws-bench"
+version = "0.0.0"
+description = "Experimental orchestration for the FWS programme: z-space vs W-space paired training, optimisation regime sweeps, ablation runners"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Ammar Tarajia" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# NOTE: dependency wiring is pending sibling-library publication. The siblings
+# (jacobian-spec, landscape-archaeology, ondes, loom) do not yet have tagged
+# releases on PyPI, so the constraints below are placeholders. `uv sync` will
+# fail until each sibling either publishes or gets wired up via `tool.uv.sources`
+# git sources — see the commented block below for the co-development pattern.
+# We intentionally do not pin versions yet: a v0.0.0 scaffold should not
+# claim compatibility with API surface that does not exist.
+dependencies = [
+    "jax>=0.10.0",
+    "jaxtyping>=0.3.9",
+    "optax",
+    "optimistix",
+    # Sibling FWS-programme libraries — unpinned placeholders.
+    "jacobian-spec",
+    "landscape-archaeology",
+    "ondes",
+    "loom",
+]
+
+# For local co-development against sibling checkouts, uncomment and adjust:
+# [tool.uv.sources]
+# jacobian-spec = { path = "../jacobian-spec", editable = true }
+# landscape-archaeology = { path = "../landscape-archaeology", editable = true }
+# ondes = { path = "../ondes", editable = true }
+# loom = { path = "../loom", editable = true }
+# Once the siblings ship on PyPI or have stable git tags, switch to git sources:
+# ondes = { git = "https://github.com/DarkbyteAT/ondes.git" }
+
+[dependency-groups]
+dev = [
+    "pyright",
+    "pytest",
+    "ruff",
+    "pre-commit",
+    "bandit",
+]
+
+[project.urls]
+Homepage = "https://github.com/DarkbyteAT/fws-bench"
+Repository = "https://github.com/DarkbyteAT/fws-bench"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fws_bench"]

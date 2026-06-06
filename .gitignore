@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.eggs/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.worktrees/
+
+# Claude Code ephemeral state
+.claude/worktrees/
+.superpowers/
+
+# Experiment artefacts
+runs/
+artefacts/
+*.duckdb

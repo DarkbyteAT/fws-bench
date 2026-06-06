@@ -1,0 +1,7 @@
+{
+    "include": ["src/fws_bench"],
+    "exclude": ["tests"],
+    "pythonVersion": "3.11",
+    "typeCheckingMode": "strict",
+    "reportMissingImports": false
+}

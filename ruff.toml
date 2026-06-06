@@ -1,0 +1,26 @@
+line-length = 120
+
+[format]
+docstring-code-format = true
+
+[lint]
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "venv",
+]
+select = ["B", "D", "E", "F", "I", "UP"]
+
+[lint.isort]
+lines-after-imports = 2
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.per-file-ignores]
+# Test functions are self-documenting through Given-When-Then structure and
+# descriptive test names; D rules don't add value here.
+"tests/**" = ["D"]
