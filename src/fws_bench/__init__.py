@@ -23,6 +23,9 @@ import optax
 from jax.flatten_util import ravel_pytree
 from jaxtyping import Array, Float, PyTree
 
+from fws_bench.multiarm import Arm, paired_train_4arm
+from fws_bench.stages import StageZeroVerdict, stage0_falsifier
+
 
 class Regime(Enum):
     """Optimisation regime for the (G, z) parameter group split.
@@ -250,5 +253,14 @@ def paired_train(
     )
 
 
-__all__ = ["PairedTrainResult", "Regime", "TrainResult", "paired_train"]
-__version__ = "0.1.0"
+__all__ = [
+    "Arm",
+    "PairedTrainResult",
+    "Regime",
+    "StageZeroVerdict",
+    "TrainResult",
+    "paired_train",
+    "paired_train_4arm",
+    "stage0_falsifier",
+]
+__version__ = "0.2.0"
