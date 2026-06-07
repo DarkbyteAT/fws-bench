@@ -1,12 +1,11 @@
-"""Phase 10 — Polar-projection ``P`` on the rendered $W$ tree.
+"""Phase 10 — Polar-projection ``P`` + per-leaf G_H normalisation.
 
-Two folded changes from phase 9, both attacking phase 9's K=3 finding
+Three folded changes from phase 9, all attacking phase 9's K=3 finding
 that the FWS-hyper-recursive arm sat at chance (10.0%) on CIFAR-10
 despite stage-0 clearing the kill rule by a wide margin (log10 spread
 2.24 OoM > 1.0 threshold). Stage-0 detected geometry; phase 10 tests
 whether the geometry was just *useless* — i.e. produced a $W$ tree that
-didn't carry classification signal because the rendered tensors at every
-leaf were uniformly distributed in $[-1, 1]$ regardless of leaf identity.
+didn't carry classification signal.
 
 1. **G_H linear readout (drop output sine).** Phase 9's ``G_H`` ended
    with ``flat = sin(omega_0 · (W_out · h + b_out))`` — every layer
@@ -18,13 +17,33 @@ leaf were uniformly distributed in $[-1, 1]$ regardless of leaf identity.
    W_out · h + b_out`` (linear). ``G_H``'s body is still SIREN; only the
    readout changes.
 
-2. **Polar-decomposition pseudo-orthonormal projection ``P``.** The
-   rendered tensor for each weight leaf is projected via
-   ``W = U V^T`` from its SVD: spectral norm = 1 at any rank, no
-   scale-dependent training pathology. Biases are normalised to a small
-   constant std. This is a per-leaf, differentiable post-render
-   projection — applied AFTER the per-leaf Kaiming scale so the
-   projection has Kaiming-statistic raw tensors to orthonormalise.
+2. **Per-leaf normalisation of G_H's output slice (NEW)**. The
+   companion phase 10 (linear-readout + Kaiming-per-leaf-on-rendered-W
+   at fws-bench commit 42384fd) shipped K=3: FWS-parallel-no-G_H went
+   from chance to 29.2%, a robust positive FWS signal, but FWS-hyper
+   stayed at chance. Diagnosis: the Kaiming pre-factor corrected the
+   *rendered W*, but the *SIREN parameters of each leaf-renderer*
+   (G_leaf's W_in / b_in / W_h / b_h / W_out / b_out) still came
+   straight from G_H's linear output with no per-leaf magnitude
+   information — every leaf-renderer received parameters at the same
+   global scale. Phase 10 (this file) z-scores each leaf's slice of
+   G_H's flat output to mean 0 / std sqrt(2/slice_size) before
+   unpacking into G_leaf params. The slice becomes Kaiming-statistic
+   per leaf, decoupled from G_H's global output drift.
+
+3. **Polar-decomposition pseudo-orthonormal projection ``P``.** The
+   rendered tensor for each weight leaf is projected via Newton-Schulz
+   iteration (``A ← 0.5 · A · (3·I − Aᵀ·A)``, 5 steps, Frobenius
+   pre-normalised) to its nearest semi-orthogonal matrix: spectral
+   norm = 1 by construction. Biases are normalised to a small constant
+   std. Differentiable through standard autodiff (NS avoids the
+   SVD-gradient collision pathology near init). Applied AFTER the
+   per-leaf Kaiming scale.
+
+Combined, the three fixes attack the FWS-hyper pathology along three
+independent axes: free G_H's output range (1), give each leaf the right
+parameter scale (2), and constrain the final rendered tensor to
+well-conditioned magnitudes (3).
 
 Stage-0 falsifier (unchanged kill rule): 3 ``G_H`` output-init scale
 choices, ``sigma_min(d render / d z)`` at steps ``{0, 100, 1000, 5000}``,
@@ -178,7 +197,23 @@ class HyperRenderer(eqx.Module):
         return self.W_out @ h + self.b_out
 
     def produce(self, z: Array, leaf_id: int, rank: int) -> dict[str, Array]:
-        return slice_g_leaf_flat(self.produce_flat(z, leaf_id), rank)
+        # Phase 10 fix 3 (added 2026-06-07): per-leaf normalisation of G_H's
+        # output slice BEFORE unpacking into G_leaf params. Without this,
+        # G_H's linear readout produces a globally-scaled flat vector, so
+        # each leaf-renderer's W_in / b_in / W_h / b_h / W_out / b_out get
+        # the same magnitude regardless of leaf identity. Per-leaf
+        # normalisation z-scores the slice to mean 0 / std sqrt(2/slice_size)
+        # — Kaiming-like statistics on the produced parameter vector,
+        # decoupled from G_H's global output drift.
+        flat = self.produce_flat(z, leaf_id)
+        slice_size = G_LEAF_PARAM_SIZE[rank]
+        leaf_slice = flat[:slice_size]
+        eps = jnp.finfo(leaf_slice.dtype).eps * slice_size
+        mean = jnp.mean(leaf_slice)
+        std = jnp.std(leaf_slice) + eps
+        target_std = jnp.sqrt(jnp.array(2.0 / slice_size, dtype=leaf_slice.dtype))
+        normalised = (leaf_slice - mean) / std * target_std
+        return slice_g_leaf_flat(normalised, rank)
 
 
 # --- Polar-decomposition pseudo-orthonormal projection ----------------------
@@ -548,42 +583,52 @@ def main() -> None:
 
 _BACKGROUND_MD = """
 Phase 9 (recursive SIREN) cleared the Stage-0 falsifier (log10 spread
-2.24 OoM ≫ 1.0 threshold) — telling us $\\sigma_{\\min}(\\partial
-\\text{render} / \\partial z)$ separated by scale and the FWS prior was
-doing geometric work — yet the FWS-hyper-recursive arm landed at chance
-(10.0%) on the CIFAR-10 classification task. Stage 0 detected geometry;
-the K=3 run revealed that the geometry was useless: the rendered $W$
-tree had no per-leaf identity (every leaf-renderer's first-layer SIREN
-weights were uniformly random in ``[-1, 1]`` because the output sine
-squashed them all into the same range) and no per-layer scale (every
-leaf rendered uniform-std ~0.577 values, whereas a real Kaiming-He init
-has per-layer std spanning 2 OoM).
+2.24 OoM ≫ 1.0 threshold) — yet the FWS-hyper-recursive arm landed at
+chance (10.0%) on the CIFAR-10 classification task. The companion phase
+10 build (linear-readout + Kaiming-per-leaf-on-rendered-W at fws-bench
+commit 42384fd) shipped K=3 results: FWS-parallel-no-$G_H$ went from
+17.91% to 29.20% (+11.3 pp), the first robust positive FWS signal
+across ten phases, but FWS-hyper-rec stayed at chance (9.14%). Phase
+10's phase 8 agent diagnosed why: the Kaiming pre-factor corrected the
+rendered $W$, but each leaf-renderer's SIREN parameters (G_leaf's
+$W_{\\text{in}}$, $b_{\\text{in}}$, $W_h$, $b_h$, $W_{\\text{out}}$,
+$b_{\\text{out}}$) still came straight from G_H's linear output with no
+per-leaf magnitude information — every leaf-renderer received
+parameters at the same global scale.
 
-Phase 10 (this phase) attacks both pathologies and adds a structural
-constraint to keep the rendered $W$ in a well-conditioned regime
-regardless of where ``G_leaf`` happens to land at init.
+Phase 10 (this phase) attacks the FWS-hyper-specific pathology along
+three independent axes simultaneously: free G_H's output range
+(linear readout), give each leaf the right SIREN parameter scale (G_H
+output per-leaf normalisation), and constrain the final rendered tensor
+to well-conditioned magnitudes (Newton-Schulz polar projection $P$).
 """
 
 _ARCHITECTURE_MD = """
-Three changes from phase 9, applied to both FWS arms (hyper and
-parallel-no-$G_H$):
+Three changes from phase 9, applied to the FWS-hyper arm; the
+FWS-parallel arm gets changes (2) and (3) only (it has no $G_H$):
 
 1. **$G_H$ linear readout.** Phase 9 ended ``G_H``'s forward with
    ``flat = sin(omega_0 · (W_out · h + b_out))``. Phase 10 drops the
-   final sine: ``flat = W_out · h + b_out``. The hidden layers are still
-   SIREN-activated. Same as phase 9 in every other respect.
+   final sine: ``flat = W_out · h + b_out``. The hidden layers stay
+   SIREN-activated. (FWS-hyper only.)
 
-2. **Per-leaf Kaiming-He scale.** Each leaf's rendered tensor is
-   multiplied by ``scale_leaf`` computed from its shape:
-   ``sqrt(2 / (in_ch · kH · kW))`` for conv, ``sqrt(2 / in_features)``
-   for fc, ``0.01`` for biases. ``scale_leaf`` is *not* trainable.
+2. **Per-leaf normalisation of G_H's output slice.** After producing
+   ``flat``, each leaf's ``G_LEAF_PARAM_SIZE[rank]``-length slice is
+   z-scored to mean 0, std ``sqrt(2 / slice_size)`` — Kaiming statistics
+   on the produced parameter vector, decoupled from G_H's global output
+   drift. This addresses the diagnosis that G_H's linear readout feeds
+   every leaf-renderer parameters at the same global scale. (FWS-hyper
+   only; FWS-parallel's per-rank ``G_leaf`` instances are already
+   SIREN-initialised.)
 
-3. **Polar-decomposition pseudo-orthonormal projection ``P``.** After
-   scaling, the rendered tensor is projected to its nearest semi-orthogonal
-   matrix via the polar decomposition: ``W = U V^T`` where ``U S V^T``
-   is the SVD. Spectral norm = 1 at any rank; well-conditioned by
-   construction. Biases get a different normalisation (standardised to
-   small constant std).
+3. **Polar-decomposition pseudo-orthonormal projection ``P``.** The
+   rendered tensor (after the per-leaf Kaiming pre-factor) is projected
+   to its nearest semi-orthogonal matrix via Newton-Schulz iteration
+   (``A ← 0.5 · A · (3·I − Aᵀ·A)``, 5 steps, Frobenius pre-normalised);
+   the result has all singular values ≈ 1. Biases are normalised to a
+   small constant std. Differentiable through standard autodiff (NS
+   avoids the SVD-gradient collision pathology at near-zero init).
+   (Applied to both FWS arms.)
 
 The Stage-0 falsifier shape is unchanged: 3 ``G_H`` output-init scales,
 ``sigma_min(d render / d z)`` at ``{0, 100, 1000, 5000}``, log10 spread
@@ -595,9 +640,17 @@ is now linear, not sine-following.
 _CAVEATS_MD = """
 - **K={K_SEED} smoke** — not K=10 confirmation.
 - **{EPOCHS} epochs only.**
-- **Polar projection is exact (full SVD)**, not Newton-Schulz iterations.
-  Differentiable per ``jax.linalg.svd``; gradient may be ill-conditioned
-  at singular-value collisions.
+- **Polar projection is Newton-Schulz (5 iterations), not exact SVD.**
+  Initial SVD-based polar produced NaN gradients at the σ-probe at init
+  (near-zero G_leaf outputs → near-zero singular-value collisions in the
+  SVD gradient). NS converges to all-σ-≈-1 in 5 steps for
+  well-conditioned inputs (Frobenius pre-normalisation keeps inputs
+  inside the convergence ball $\\|A\\|_2 < \\sqrt{{3}}$).
+- **Per-leaf G_H output normalisation is parameter-free** — z-score the
+  slice to mean 0, std sqrt(2/slice_size). Not LayerNorm with learnable
+  scale (which would re-introduce a per-leaf parameter trained against
+  the task loss). Future ablation: LayerNorm with learnable scale vs
+  parameter-free z-score.
 - **Bias projection is *not* orthonormal** — it's a std-renormalisation
   step. Treat bias projection as a numerical sanity, not a structural
   constraint.
