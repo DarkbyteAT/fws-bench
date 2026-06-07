@@ -54,10 +54,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
+from landscape_archaeology import singular_spectrum
+
+from fws_bench import StageZeroVerdict, paired_train_4arm, stage0_falsifier
 
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _common import arms, data, diagnostics, mainnet, reporting, training  # noqa: E402
+from _common import arms, data, diagnostics, mainnet, reporting  # noqa: E402
 from _common.arms import (  # noqa: E402
     DIM_Z,
     G_LEAF_HIDDEN_DIM,
@@ -224,6 +227,7 @@ def project_pseudo_orthonormal(W: Array, leaf_name: str) -> Array:
 # --- Phase-specific schedule ------------------------------------------------
 EPOCHS = int(os.environ.get("PHASE10_EPOCHS", 5))
 K_SEED = int(os.environ.get("PHASE10_K_SEED", 3))
+BATCH_SIZE = 128
 FALSIFIER_STEPS = int(os.environ.get("PHASE10_FALSIFIER_STEPS", 5000))
 FALSIFIER_CHECKPOINTS: tuple[int, ...] = (0, 100, 1000, FALSIFIER_STEPS)
 
@@ -231,6 +235,38 @@ SIGMA_TOP_K = 5
 SIGMA_POWER_ITERS = 10
 HESSIAN_POWER_ITERS = 5
 EVAL_HESS_BATCH = 1024
+
+
+# --- CIFAR-mainnet eval helpers (passed to fws_bench.paired_train_4arm) ----
+def _eval_test_loss_acc(
+    params: dict[str, Array], test_x: np.ndarray, test_y: np.ndarray,
+) -> tuple[float, float]:
+    chunk = 1024
+    n = test_x.shape[0]
+    total_loss = 0.0
+    total_correct = 0
+    for i in range(0, n, chunk):
+        bx = jnp.asarray(test_x[i:i + chunk])
+        by = jnp.asarray(test_y[i:i + chunk])
+        logits = jax.vmap(lambda x: mainnet.cnn_forward(params, x))(bx)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        one_hot = jax.nn.one_hot(by, mainnet.NUM_CLASSES)
+        loss = -jnp.mean(jnp.sum(one_hot * log_probs, axis=-1))
+        preds = jnp.argmax(logits, axis=-1)
+        total_loss += float(loss) * bx.shape[0]
+        total_correct += int(jnp.sum(preds == by))
+    return total_loss / n, total_correct / n
+
+
+def _all_test_preds(params: dict[str, Array], test_x: np.ndarray) -> np.ndarray:
+    chunk = 1024
+    n = test_x.shape[0]
+    preds = np.empty(n, dtype=np.int32)
+    for i in range(0, n, chunk):
+        bx = jnp.asarray(test_x[i:i + chunk])
+        logits = jax.vmap(lambda x: mainnet.cnn_forward(params, x))(bx)
+        preds[i:i + chunk] = np.asarray(jnp.argmax(logits, axis=-1))
+    return preds
 
 
 def make_fws_hyper_arm(out_scale_kind: str = "linear_xavier") -> arms.Arm:
@@ -269,20 +305,23 @@ _PARALLEL_RENDER = arms.make_fws_parallel(
 
 def sigma_at_z_hyper(state: dict) -> Array:
     op = lambda z_var: _HYPER_RENDER({"G": state["G"], "z": z_var})  # noqa: E731
-    return diagnostics.sigma_spectrum_op(op, state["z"],
-                                        k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS, seed=7)
+    return singular_spectrum(op, state["z"],
+                             k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS,
+                             key=jax.random.key(7))
 
 
 def sigma_at_gh_hyper(state: dict) -> Array:
     op = lambda G_var: _HYPER_RENDER({"G": G_var, "z": state["z"]})  # noqa: E731
-    return diagnostics.sigma_spectrum_op(op, state["G"],
-                                        k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS, seed=13)
+    return singular_spectrum(op, state["G"],
+                             k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS,
+                             key=jax.random.key(13))
 
 
 def sigma_at_z_parallel(state: dict) -> Array:
     op = lambda z_var: _PARALLEL_RENDER({"P": state["P"], "z": z_var})  # noqa: E731
-    return diagnostics.sigma_spectrum_op(op, state["z"],
-                                        k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS, seed=7)
+    return singular_spectrum(op, state["z"],
+                             k=SIGMA_TOP_K, num_iterations=SIGMA_POWER_ITERS,
+                             key=jax.random.key(7))
 
 
 _shared_train_x: np.ndarray
@@ -315,8 +354,10 @@ def per_seed_diagnostics(seed: int, states: dict, final_Ws: dict[str, dict[str, 
     hess_batch = {"x": jnp.asarray(_shared_train_x[hess_idx]),
                   "y": jnp.asarray(_shared_train_y[hess_idx])}
     for short, W in final_Ws.items():
-        hess[short] = float(np.asarray(diagnostics.hessian_top(
-            W, hess_batch, k=SIGMA_TOP_K, num_iterations=HESSIAN_POWER_ITERS))[0])
+        grad_fn = jax.grad(lambda p, b=hess_batch: mainnet.cross_entropy_loss(p, b))
+        hess[short] = float(np.asarray(singular_spectrum(
+            grad_fn, W, k=SIGMA_TOP_K, num_iterations=HESSIAN_POWER_ITERS,
+            key=jax.random.key(11)))[0])
 
     return {
         "sigma_z_hyper": sigma_z_hyper,
@@ -351,17 +392,17 @@ def main() -> None:
           f"leaf_emb=({mainnet.N_LEAVES},{DIM_LEAF_EMB})")
     for a in arms_list:
         print(f"  {a.name:32s}: {counts[a.short]}")
-    print(f"K_seed={K_SEED}, epochs={EPOCHS}, batch={training.BATCH_SIZE}, "
+    print(f"K_seed={K_SEED}, epochs={EPOCHS}, batch={BATCH_SIZE}, "
           f"falsifier_steps={FALSIFIER_STEPS}")
     print()
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
-    stage0_verdict: training.Stage0Verdict | None = None
+    stage0_verdict: StageZeroVerdict | None = None
     if stage in ("falsifier", "all"):
         t0 = time.time()
-        stage0_verdict = training.stage0_falsifier(
+        stage0_verdict = stage0_falsifier(
             arm_factory=lambda sk: make_fws_hyper_arm(sk),
             scale_kinds=SCALE_KINDS,
             train_x=train_x, train_y=train_y,
@@ -386,11 +427,13 @@ def main() -> None:
         if stage0_verdict is not None and not stage0_verdict.proceed and stage == "all":
             print("\nSTOP — Stage 0 verdict says init recovery, not FWS prior. K=3 skipped.")
         else:
-            per_seed, nan_or_crash, k3_wall = training.paired_train_4arm(
-                arms_list=arms_list,
+            per_seed, nan_or_crash, k3_wall = paired_train_4arm(
+                arms=arms_list,
                 train_x=train_x, train_y=train_y,
-                test_x=test_x, test_y=test_y,
+                eval_fn=lambda W: _eval_test_loss_acc(W, test_x, test_y),
+                predict_fn=lambda W: _all_test_preds(W, test_x),
                 num_epochs=EPOCHS, K_seed=K_SEED,
+                batch_size=BATCH_SIZE,
                 per_seed_diagnostics=per_seed_diagnostics,
             )
 

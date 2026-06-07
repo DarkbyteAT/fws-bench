@@ -1,24 +1,38 @@
-"""Themed fixtures shared by phase-N CIFAR-10 example scripts.
+"""Examples-side glue shared by phase-N CIFAR-10 scripts.
 
-Phases 8/9/10 of the FWS programme share ~95% of their code (WideKernelCNN
-mainnet, CIFAR-10 loader, W-matched / W-overparam / FWS-parallel-no-G_H
-baselines, Adam(1e-3) paired training, HT-SR / radial-FFT / Jacobian-σ /
-Hessian diagnostics, the same eight plots, and the research-log writer).
-The actual phase-specific architectural change is the FWS-hyper arm's
-``G_H`` and renderer, ~50-100 LoC per phase.
+This subpackage is the *instantiation layer* for the FWS CIFAR phases —
+the WideKernelCNN-SiLU topology, the CIFAR-10 loader, the three baseline
+arms that compose the ``fws-bench`` machinery with this specific
+mainnet, the mainnet-specific α / G_leaf diagnostic helpers, and the
+plots + research-log writer. The library-side machinery has moved
+upstream:
 
-This subpackage owns the shared 95%; each phase file owns its own
-``G_H`` + ``fws_hyper`` arm + ``main()`` wiring.
+- Stage-0 falsifier + N-arm paired training + ``Arm`` value type —
+  :mod:`fws_bench`.
+- Spectrum-fit power-law diagnostics (HT-SR α, radial-FFT α) and
+  Jacobian / Hessian σ-spectra — :mod:`landscape_archaeology`.
+
+Each phase file imports from all three: :mod:`fws_bench` for the
+harness, :mod:`landscape_archaeology` for spectral probes, and
+``_common`` for the CIFAR-specific instantiations and plots.
 
 Submodules:
 
-- :mod:`mainnet`    — WideKernelCNN-SiLU topology, leaf layout, direct CNN forward.
-- :mod:`data`       — CIFAR-10 loader with ``~/.cache/cifar10``.
-- :mod:`arms`       — ``Arm`` value type + ``ParallelGLeaves`` + the three
-                       common arms (W matched, W overparam, FWS-parallel-no-G_H).
-- :mod:`training`   — paired step + Stage-0 ``σ_min`` falsifier orchestration.
-- :mod:`diagnostics`— HT-SR α, radial-FFT α, σ-spectrum, Hessian top-eig probes.
-- :mod:`reporting`  — Wong-palette plots, research-log writer, ``quill`` PDF render.
+- :mod:`mainnet`     — WideKernelCNN-SiLU topology, leaf layout, direct
+                        CNN forward + loss, ``init_cnn_params`` (W matched),
+                        ``OverparamCNN`` (W overparam).
+- :mod:`data`        — CIFAR-10 loader with ``~/.cache/cifar10``.
+- :mod:`arms`        — Three baseline arm factories (``make_w_matched``,
+                        ``make_w_overparam``, ``make_fws_parallel``) and an
+                        FWS-hyper helper (``make_fws_hyper``). All return
+                        :class:`fws_bench.Arm`. Owns the ``G_leaf``
+                        primitive, ``ParallelGLeaves``, ``LEAF_COORDS``,
+                        and the Wong palette.
+- :mod:`diagnostics` — ``per_leaf_alphas`` (calls landscape-archaeology),
+                        ``g_leaf_cosine_matrix``, ``count_params``,
+                        ``global_l2_norm``. Mainnet-specific glue only.
+- :mod:`reporting`   — Wong-palette plots, research-log writer, ``quill``
+                        PDF render.
 
 Phase scripts import these as a flat sibling package after prepending
 ``examples/`` to ``sys.path``::
@@ -26,12 +40,12 @@ Phase scripts import these as a flat sibling package after prepending
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
-    from _common import mainnet, data, arms, training, diagnostics, reporting
+    from _common import arms, data, diagnostics, mainnet, reporting
 """
 
 from __future__ import annotations
 
-from . import arms, data, diagnostics, mainnet, reporting, training
+from . import arms, data, diagnostics, mainnet, reporting
 
 
-__all__ = ["arms", "data", "diagnostics", "mainnet", "reporting", "training"]
+__all__ = ["arms", "data", "diagnostics", "mainnet", "reporting"]

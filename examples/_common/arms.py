@@ -1,21 +1,19 @@
-"""Arm value type + shared arms (W matched, W overparam, FWS-parallel-no-G_H).
+"""Baseline arm instantiations + G_leaf machinery for the CIFAR / WideKernelCNN phases.
 
-An :class:`Arm` is the minimum contract the paired-training loop needs from
-each of the four arms in a phase: a name, a palette colour, a function from
-seed to initial trainable state, a loss function over that state, a renderer
-(``state -> rendered W tree``) so diagnostics can index by leaf, and the
-``optax`` optimiser used for that arm.
+Three baseline arms (W matched, W overparam, FWS-parallel-no-G_H) and an
+``FWS-hyper`` constructor live here. Each returns an :class:`fws_bench.Arm`
+— the contract value type owned by ``fws-bench`` — wired to the CIFAR
+WideKernelCNN-SiLU mainnet from :mod:`._common.mainnet`.
 
-Phase scripts construct their phase-specific FWS-hyper arm inline; the
-three constants — :func:`make_w_matched`, :func:`make_w_overparam`,
-:func:`make_fws_parallel` — are the same across phases 8/9/10 and live
-here.
+This module is examples-side glue: it composes the ``fws-bench`` harness
+machinery with the specific CIFAR mainnet and ``G_leaf`` parameter
+layout shared across phases 8/9/10. The phase scripts construct their
+phase-specific ``G_H`` and pass it to :func:`make_fws_hyper`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import equinox as eqx
@@ -24,6 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from jaxtyping import Array, Float
+
+from fws_bench import Arm
 
 from . import mainnet
 
@@ -196,40 +196,6 @@ class ParallelGLeaves(eqx.Module):
             4: (self.film_W_rank4, self.film_b_rank4),
         }[rank]
         return W @ z + b
-
-
-# --- Arm value type --------------------------------------------------------
-@dataclass(frozen=True)
-class Arm:
-    """One arm of the 4-arm paired training contract.
-
-    Fields:
-
-    - ``name``  — human-readable label (e.g. ``"FWS-hyper"``).
-    - ``short`` — slug used in figure filenames (e.g. ``"fws_hyper"``).
-    - ``color`` — Wong-palette hex string.
-    - ``init`` — ``PRNGKey -> trainable_state``. ``trainable_state`` may be
-      any pytree; for FWS arms it is typically ``{"G": G_H, "z": z}``, for
-      W matched it is a leaf-dict, for W overparam it is an
-      :class:`mainnet.OverparamCNN`.
-    - ``loss_fn`` — ``(state, batch) -> scalar``. For FWS arms this is
-      "render then cross-entropy"; for W arms it is direct cross-entropy.
-    - ``render_W`` — ``state -> rendered W tree``. Lets diagnostics index
-      α, σ-spectra, Hessian top-eigs etc. by leaf without knowing the arm
-      shape. For W matched ``render_W`` is the identity; for W overparam
-      it is ``materialise()``.
-    - ``optimiser`` — pre-built ``optax`` gradient transformation. For
-      FWS-hyper this is :func:`optax.multi_transform` over the
-      ``{"G", "z"}`` partition.
-    """
-
-    name: str
-    short: str
-    color: str
-    init: Callable[[Array], Any]
-    loss_fn: Callable[[Any, dict], Array]
-    render_W: Callable[[Any], dict[str, Array]]
-    optimiser: optax.GradientTransformation
 
 
 # --- Wong colourblind-safe palette -----------------------------------------
