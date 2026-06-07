@@ -14,32 +14,62 @@ CIFAR-10). Two hypotheses are consistent with that record:
   cross-entropy outer landscape (through softmax → CNN forward →
   rendering chain) is hostile to gradient descent at the scales we ran.
 
-Phase 11B disambiguates by **direct L2 distillation**. We
+**Literature anchoring.** NeRN (Ashkenazi et al., arXiv:2212.13554,
+2023) is the direct prior art: a coordinate→weight predictor trained
+by L2 distillation against a fixed CIFAR/ImageNet classifier, with
+explicit accuracy-preservation evaluation. Phase 11B largely
+replicates NeRN's setup. The fws-bench novelty axis is **sine-only
+SIREN backbone + polar projection $P$ on the latent** (NeRN uses an
+MLP and imposes no geometric constraint on the latent code).
+
+Both NeRN AND Schürholt et al. (Hyper-Representations,
+arXiv:2209.14733, 2022) report a known failure mode of leaf-uniform
+L2: low MSE, near-zero task accuracy, because weight distributions
+vary by 1–2 OoM across layer types (fc ∼ 0.1, conv ∼ 0.01, bias ≈ 0).
+Uniform L2 underweights small-std layers; tiny absolute perturbations
+to those layers destroy classification accuracy. Schürholt's fix is
+**layer-wise normalisation**: scale each leaf's contribution to the
+loss by its target's standard deviation. Phase 11B runs both losses
+as paired cells so the verdict is read from the 4-way grid below
+rather than from a single number.
+
+Phase 11B's design:
 
 1. train a vanilla ``WideKernelCNN-SiLU`` on CIFAR-10 with Adam(1e-3)
    for 5 epochs — this hits ≈60% test accuracy and produces a single
-   target weight tree $W^{\\star}$.
+   target weight tree $W^{\\star}$. No smoothness regulariser on
+   $W^{\\star}$ (NeRN imposes one; we leave it off for the first-pass
+   diagnostic).
 2. for each FWS arm (FWS-hyper-polar with the phase 10 architecture;
    FWS-parallel-no-G_H with polar $P$), train the arm's parameters by
-   Adam(1e-3) to minimise the leaf-summed mean-squared error
-   $\\sum_{\\ell} \\| W_{\\ell}(state) - W^{\\star}_{\\ell} \\|^2 / n_{\\ell}$
-   for 5000 outer steps. **No task loss.** Pure L2.
+   Adam(1e-3) for 5000 outer steps under **each** of two losses:
+
+   - **leaf-mean**:
+     $\\sum_{\\ell} \\text{mean}((W_{\\ell}(\\text{state}) -
+     W^{\\star}_{\\ell})^2)$ — leaf-uniform.
+   - **layer-wise normalised** (Schürholt 2022): each leaf's mean
+     squared error is divided by $\\text{std}(W^{\\star}_{\\ell})^2$,
+     so each leaf contributes proportionally to its native magnitude.
+
 3. evaluate the distilled rendered $W$ as a CNN on the CIFAR-10 test
    set — functional fidelity. Compare per-leaf HT-SR / radial-FFT
    $\\alpha$ between rendered and target.
 
-Pre-registered interpretation rules:
+Pre-registered 4-way interpretation grid (per arm, per loss):
 
-- FWS-parallel L2-fits cleanly AND functional fidelity ≥ 40% →
-  parallel architecture *can* represent trained CIFAR weights; phase 9
-  / 10 task-loss failure was training dynamics, not representation.
-- FWS-hyper L2-fits cleanly AND functional fidelity ≥ 40% → hyper
-  architecture *can* represent trained CIFAR weights; its task-loss
-  failure was about the chain rule through $G_H$, not expressive power.
-- Neither L2-fits → per-leaf hyper-renderer family is the wrong shape;
-  pivot.
-- FWS-parallel fits but FWS-hyper doesn't → the meta-renderer layer
-  specifically breaks representation, not just optimisation.
+1. **low L2 + high fidelity (≥ 0.40)** → architecture can both
+   represent and preserve the trained net's function. Clean positive.
+2. **low L2 + low fidelity** → NeRN/Schürholt brittleness; check
+   whether the layer-wise cell rescues fidelity. If yes, the
+   architecture *is* expressive and phase 6/8/9/10 failures were
+   optimisation dynamics, not representation.
+3. **high L2 + low fidelity** → architecture cannot fit the target;
+   per-leaf hyper-renderer family is the wrong shape.
+4. **high L2 + high fidelity** → implausible; instrumentation bug.
+
+A robust pivot signal requires case 3 to fire under **both** losses
+(the layer-wise cell rules out brittleness as the explanation for the
+high-L2 failure).
 
 Run::
 
@@ -154,25 +184,67 @@ def eval_test_loss_acc(
 
 
 # --- Distillation loss + loop ---------------------------------------------
+# Two losses, run as paired cells per the Schürholt 2022 anchoring:
+#
+# - ``leaf_mean``         : sum over leaves of ``mean((W_rendered - W*)**2)``.
+#                           Leaf-uniform; matches the NeRN default and the
+#                           first-pass interpretation grid.
+# - ``layerwise_normalised``: each leaf's mean-squared error is divided by
+#                            ``var(W*_leaf) + eps``; layers with small native
+#                            std contribute proportionally to large-std
+#                            layers, so the optimiser cannot ignore fc /
+#                            conv-bias rows.
+LossKind = str  # "leaf_mean" | "layerwise_normalised"
+
+
+def leaf_weights(target: dict[str, Array], kind: LossKind) -> dict[str, float]:
+    """Compute per-leaf loss weights for the given loss kind.
+
+    For ``leaf_mean`` every weight is 1. For ``layerwise_normalised``
+    each weight is ``1 / (var(target_leaf) + eps)`` — Schürholt 2022's
+    layer-wise normalisation. The eps protects bias leaves whose target
+    std can be near zero from blowing up the gradient.
+    """
+    if kind == "leaf_mean":
+        return {name: 1.0 for name in mainnet.LEAF_ORDER}
+    if kind == "layerwise_normalised":
+        weights: dict[str, float] = {}
+        for name in mainnet.LEAF_ORDER:
+            t = np.asarray(target[name])
+            # eps tied to the dtype keeps a near-zero-std bias from producing
+            # a gradient orders of magnitude larger than the weight leaves.
+            eps = float(np.finfo(t.dtype).eps) * t.size
+            var = float(t.var()) + eps
+            weights[name] = 1.0 / var
+        return weights
+    raise ValueError(f"unknown loss kind {kind!r}")
+
+
 def mse_to_target(
     rendered: dict[str, Array], target: dict[str, Array],
+    *, weights: dict[str, float],
 ) -> Array:
-    """Per-leaf mean-squared error, summed across leaves.
+    """Weighted per-leaf mean-squared error, summed across leaves.
 
-    Each leaf contributes ``mean((W_rendered - W_target) ** 2)`` — the
-    leaf-wise mean (rather than total sum of squares) keeps the scale
-    of the loss insensitive to fc1's much-larger parameter count.
+    ``weights[name]`` is the per-leaf scalar multiplying that leaf's
+    ``mean((W_rendered - W_target) ** 2)``. Uniform-1 weights give the
+    NeRN-style leaf-uniform loss; ``1 / var(target_leaf)`` weights give
+    Schürholt's layer-wise-normalised loss.
     """
     return sum(
-        jnp.mean((rendered[name] - target[name]) ** 2)
+        weights[name] * jnp.mean((rendered[name] - target[name]) ** 2)
         for name in mainnet.LEAF_ORDER
     )
 
 
-def per_leaf_l2(
+def per_leaf_l2_sse(
     rendered: dict[str, Array], target: dict[str, Array],
 ) -> dict[str, float]:
-    """Per-leaf $\\|W_{rendered} - W^{\\star}\\|^2$ (sum of squares, not mean)."""
+    """Per-leaf $\\|W_{rendered} - W^{\\star}\\|^2$ (sum of squares, not mean).
+
+    Loss-kind independent: used as the cell-commensurable raw L2 in the
+    4-way grid verdict.
+    """
     return {
         name: float(jnp.sum((rendered[name] - target[name]) ** 2))
         for name in mainnet.LEAF_ORDER
@@ -181,26 +253,25 @@ def per_leaf_l2(
 
 def distill_arm(
     arm: arms.Arm, target_W: dict[str, Array],
-    *, seed: int, num_steps: int, lr: float,
+    *, seed: int, num_steps: int, lr: float, loss_kind: LossKind,
 ) -> tuple[dict, list[tuple[int, float]], dict[str, Array]]:
     """L2-distill ``arm`` against ``target_W`` for ``num_steps`` Adam steps.
 
-    Returns ``(final_state, [(step, total_mse), ...], rendered_W_final)``.
+    Returns ``(final_state, [(step, total_loss), ...], rendered_W_final)``.
     """
     key = jax.random.key(seed)
     state = arm.init(key)
 
-    # Override the arm's optimiser to a flat Adam(lr) on the full state pytree —
-    # FWS-hyper's multi_transform partition is fine here too because we keep
-    # using the arm's own optimiser through optax.apply_updates. But the arm
-    # was constructed with its own LRs; for distillation we re-build a single
-    # Adam(lr) over the state to match the brief's "Adam(1e-3)" spec.
+    # Override the arm's optimiser to a flat Adam(lr) on the full state pytree
+    # so the brief's "Adam(1e-3)" spec applies uniformly across cells.
     optimiser = optax.adam(lr)
     opt_state = optimiser.init(state)
 
+    weights = leaf_weights(target_W, loss_kind)
+
     def loss_fn(state: Any) -> Array:
         rendered = arm.render_W(state)
-        return mse_to_target(rendered, target_W)
+        return mse_to_target(rendered, target_W, weights=weights)
 
     @jax.jit
     def step(state: Any, opt_state: Any) -> tuple[Any, Any, Array]:
@@ -214,8 +285,8 @@ def distill_arm(
         if s % LOG_EVERY == 0 or s == num_steps - 1:
             trajectory.append((s, float(loss)))
         if s % 1000 == 0:
-            print(f"    distill step {s}/{num_steps}: total_mse={float(loss):.6e}",
-                  flush=True)
+            print(f"    distill step {s}/{num_steps} [{loss_kind}]: "
+                  f"loss={float(loss):.6e}", flush=True)
     rendered = {k: np.asarray(v) for k, v in arm.render_W(state).items()}
     return state, trajectory, rendered
 
@@ -242,86 +313,55 @@ def make_fws_parallel_distill_arm() -> arms.Arm:
 
 # --- Plots -----------------------------------------------------------------
 def plot_distill_trajectories(
-    trajectories: dict[str, list[list[tuple[int, float]]]],
+    trajectories_per_cell: dict[str, dict[str, list[list[tuple[int, float]]]]],
     arms_order: list[arms.Arm],
     save_path: Path, *, title: str,
 ) -> None:
-    """Plot per-arm L2 distillation MSE trajectories: faint per-seed + bold median."""
+    """Per-cell × per-arm L2 distillation trajectories: faint per-seed + bold median."""
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(8.0, 4.8))
-    for a in arms_order:
-        rows = trajectories[a.short]
-        for traj in rows:
-            xs = [t[0] for t in traj]
-            ys = [t[1] for t in traj]
-            ax.plot(xs, ys, color=a.color, alpha=0.3, linewidth=1.0)
-        stack = np.stack([[t[1] for t in traj] for traj in rows], axis=0)
-        xs = [t[0] for t in rows[0]]
-        ax.plot(xs, np.median(stack, axis=0), color=a.color, linewidth=2.0, label=a.name)
-    ax.set_yscale("log")
-    ax.set(xlabel="distillation step", ylabel="total per-leaf MSE", title=title)
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
+    cells = list(trajectories_per_cell.keys())
+    fig, axes = plt.subplots(1, len(cells), figsize=(7.5 * len(cells), 4.8), sharey=False)
+    if len(cells) == 1:
+        axes = [axes]
+    for ax, cell in zip(axes, cells, strict=True):
+        per_arm = trajectories_per_cell[cell]
+        for a in arms_order:
+            rows = per_arm[a.short]
+            for traj in rows:
+                xs = [t[0] for t in traj]
+                ys = [t[1] for t in traj]
+                ax.plot(xs, ys, color=a.color, alpha=0.3, linewidth=1.0)
+            stack = np.stack([[t[1] for t in traj] for traj in rows], axis=0)
+            xs = [t[0] for t in rows[0]]
+            ax.plot(xs, np.median(stack, axis=0), color=a.color, linewidth=2.0,
+                    label=a.name)
+        ax.set_yscale("log")
+        ax.set(xlabel="distillation step", ylabel=f"total {cell} loss",
+               title=f"{cell}")
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(True, which="both", alpha=0.3)
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
 def plot_functional_fidelity_box(
-    accs: dict[str, list[float]], target_acc: float,
+    accs_per_cell: dict[str, dict[str, list[float]]], target_acc: float,
     arms_order: list[arms.Arm],
     save_path: Path, *, title: str,
 ) -> None:
-    """Boxplot of test accuracy from the distilled rendered W per arm + target line."""
+    """Per-cell × per-arm boxplot of test accuracy from the distilled W."""
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7.0, 4.4))
-    data = [accs[a.short] for a in arms_order]
-    cols = [a.color for a in arms_order]
-    labels = [a.name.replace("FWS-parallel-no-G_H", "FWS-par") for a in arms_order]
-    bp = ax.boxplot(data, patch_artist=True, widths=0.55, showfliers=False,
-                    tick_labels=labels)
-    for patch, c in zip(bp["boxes"], cols, strict=True):
-        patch.set_facecolor(c)
-        patch.set_alpha(0.35)
-        patch.set_edgecolor(c)
-    for ml, c in zip(bp["medians"], cols, strict=True):
-        ml.set_color(c)
-        ml.set_linewidth(2.0)
+    cells = list(accs_per_cell.keys())
+    fig, axes = plt.subplots(1, len(cells), figsize=(7.0 * len(cells), 4.6),
+                             sharey=True)
+    if len(cells) == 1:
+        axes = [axes]
     rng = np.random.default_rng(0)
-    for i, (vals, c) in enumerate(zip(data, cols, strict=True), start=1):
-        v = np.asarray(vals, dtype=float)
-        jitter = rng.uniform(-0.10, 0.10, size=v.size)
-        ax.scatter(np.full_like(v, i) + jitter, v, color=c, s=40, zorder=3,
-                   edgecolor="white", linewidths=0.6)
-    ax.axhline(target_acc, color="#000000", linestyle="--", linewidth=1.5,
-               label=f"target CNN (acc={target_acc:.3f})")
-    ax.axhline(0.10, color="#888888", linestyle=":", linewidth=1.0, label="chance (0.10)")
-    ax.axhline(0.40, color="#888888", linestyle="-.", linewidth=1.0,
-               label="interpretation threshold (0.40)")
-    ax.set_ylabel("test accuracy from distilled rendered W")
-    ax.set_title(title)
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(fontsize=8, loc="best")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_alpha_comparison(
-    alphas_target: dict[str, tuple[float, float]],
-    alphas_per_arm: dict[str, list[dict[str, tuple[float, float]]]],
-    arms_order: list[arms.Arm],
-    save_path: Path, *, title: str,
-) -> None:
-    """Per-leaf $\\alpha$ comparison: target horizontal line + per-arm boxes per leaf."""
-    import matplotlib.pyplot as plt
-    leaves = ("conv1", "conv2", "fc1", "fc2")
-    fig, axes = plt.subplots(1, 4, figsize=(14.0, 4.4), sharey=False)
-    for ax, leaf in zip(axes, leaves, strict=True):
-        data = [
-            [seed_alpha[leaf][0] for seed_alpha in alphas_per_arm[a.short]]
-            for a in arms_order
-        ]
+    for ax, cell in zip(axes, cells, strict=True):
+        accs = accs_per_cell[cell]
+        data = [accs[a.short] for a in arms_order]
         cols = [a.color for a in arms_order]
         labels = [a.name.replace("FWS-parallel-no-G_H", "FWS-par") for a in arms_order]
         bp = ax.boxplot(data, patch_artist=True, widths=0.55, showfliers=False,
@@ -333,11 +373,18 @@ def plot_alpha_comparison(
         for ml, c in zip(bp["medians"], cols, strict=True):
             ml.set_color(c)
             ml.set_linewidth(2.0)
-        alpha_t, r2_t = alphas_target[leaf]
-        ax.axhline(alpha_t, color="#000000", linestyle="--", linewidth=1.5,
-                   label=f"target α={alpha_t:.2f} (R²={r2_t:.2f})")
-        ax.set_title(leaf)
-        ax.tick_params(axis="x", labelsize=7)
+        for i, (vals, c) in enumerate(zip(data, cols, strict=True), start=1):
+            v = np.asarray(vals, dtype=float)
+            jitter = rng.uniform(-0.10, 0.10, size=v.size)
+            ax.scatter(np.full_like(v, i) + jitter, v, color=c, s=40, zorder=3,
+                       edgecolor="white", linewidths=0.6)
+        ax.axhline(target_acc, color="#000000", linestyle="--", linewidth=1.5,
+                   label=f"target CNN ({target_acc:.3f})")
+        ax.axhline(0.10, color="#888888", linestyle=":", linewidth=1.0, label="chance")
+        ax.axhline(0.40, color="#888888", linestyle="-.", linewidth=1.0,
+                   label="interp. threshold 0.40")
+        ax.set_title(cell)
+        ax.set_ylabel("test acc from distilled W")
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(fontsize=7, loc="best")
     fig.suptitle(title, fontsize=11)
@@ -346,23 +393,71 @@ def plot_alpha_comparison(
     plt.close(fig)
 
 
+def plot_alpha_comparison(
+    alphas_target: dict[str, tuple[float, float]],
+    alphas_per_cell: dict[str, dict[str, list[dict[str, tuple[float, float]]]]],
+    arms_order: list[arms.Arm],
+    save_path: Path, *, title: str,
+) -> None:
+    """Per-cell × per-leaf $\\alpha$ comparison: target horizontal line + per-arm boxes."""
+    import matplotlib.pyplot as plt
+    leaves = ("conv1", "conv2", "fc1", "fc2")
+    cells = list(alphas_per_cell.keys())
+    fig, axes = plt.subplots(len(cells), 4, figsize=(14.0, 4.4 * len(cells)),
+                             sharey=False)
+    if len(cells) == 1:
+        axes = np.array([axes])
+    for row, cell in enumerate(cells):
+        alphas_per_arm = alphas_per_cell[cell]
+        for col, leaf in enumerate(leaves):
+            ax = axes[row, col]
+            data = [
+                [seed_alpha[leaf][0] for seed_alpha in alphas_per_arm[a.short]]
+                for a in arms_order
+            ]
+            cols_ = [a.color for a in arms_order]
+            labels = [a.name.replace("FWS-parallel-no-G_H", "FWS-par") for a in arms_order]
+            bp = ax.boxplot(data, patch_artist=True, widths=0.55, showfliers=False,
+                            tick_labels=labels)
+            for patch, c in zip(bp["boxes"], cols_, strict=True):
+                patch.set_facecolor(c)
+                patch.set_alpha(0.35)
+                patch.set_edgecolor(c)
+            for ml, c in zip(bp["medians"], cols_, strict=True):
+                ml.set_color(c)
+                ml.set_linewidth(2.0)
+            alpha_t, r2_t = alphas_target[leaf]
+            ax.axhline(alpha_t, color="#000000", linestyle="--", linewidth=1.5,
+                       label=f"target α={alpha_t:.2f} (R²={r2_t:.2f})")
+            ax.set_title(f"{cell} — {leaf}")
+            ax.tick_params(axis="x", labelsize=7)
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.legend(fontsize=7, loc="best")
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
 # --- Reporting helpers -----------------------------------------------------
 def per_arm_summary_md(
     arms_order: list[arms.Arm],
-    final_mse: dict[str, list[float]],
+    final_loss: dict[str, list[float]],
     per_leaf_l2_per_arm: dict[str, list[dict[str, float]]],
     func_acc: dict[str, list[float]],
     target_acc: float,
+    *, cell_name: str,
 ) -> str:
-    """Per-arm verbatim L2 + functional-fidelity table."""
+    """Per-arm verbatim loss + per-leaf L2 + functional-fidelity table."""
     rows: list[str] = []
     rows.append(
-        "| arm | total MSE (median) | total MSE (min) | total MSE (max) | "
+        f"| arm | total {cell_name} loss (median) | "
+        f"total {cell_name} loss (min) | total {cell_name} loss (max) | "
         "func acc (median) | func acc (min) | func acc (max) |"
     )
     rows.append("|---|---|---|---|---|---|---|")
     for a in arms_order:
-        m = np.asarray(final_mse[a.short])
+        m = np.asarray(final_loss[a.short])
         f = np.asarray(func_acc[a.short])
         rows.append(
             f"| {a.name} | {np.median(m):.4e} | {m.min():.4e} | {m.max():.4e} "
@@ -370,7 +465,11 @@ def per_arm_summary_md(
         )
     text = "\n".join(rows) + f"\n\nTarget CNN test accuracy: **{target_acc:.4f}**\n\n"
 
-    text += "### Per-leaf L2 (sum of squares) — median across seeds\n\n"
+    text += (
+        f"### Per-leaf raw L2 ($\\|W_{{\\text{{rendered}}}} - "
+        f"W^{{\\star}}\\|^2$, sum of squares, "
+        f"loss-kind-independent) — median across seeds\n\n"
+    )
     leaf_hdr = "| arm | " + " | ".join(mainnet.LEAF_ORDER) + " |"
     leaf_sep = "|---|" + "|".join(["---"] * len(mainnet.LEAF_ORDER)) + "|"
     leaf_rows = [leaf_hdr, leaf_sep]
@@ -405,52 +504,112 @@ def alpha_table_md(
     return "\n".join(rows)
 
 
-def decide_interpretation(
-    final_mse_median: dict[str, float], func_acc_median: dict[str, float],
-    *, mse_clean_threshold: float, func_threshold: float,
-) -> str:
-    """Apply the pre-registered interpretation rules.
+def _bucket(loss: float, fidelity: float, *,
+            l2_clean_threshold: float, func_threshold: float) -> str:
+    """Return one of {low_L2_high_F, low_L2_low_F, high_L2_high_F, high_L2_low_F}.
 
-    The L2 "clean fit" threshold is heuristic — the brief says no
-    pre-committed number on the L2 itself, the verdict comes from the
-    *combination* of L2 trajectory + functional fidelity. Here we use
-    a soft threshold to label each arm clean / not-clean for the
-    pre-registered rule firing; the verbatim numbers are reported above.
+    L2 is computed as the **per-leaf raw sum-of-squares L2 distance**
+    (loss-kind-independent), not the weighted training loss — so the
+    "low L2" boundary is comparable across cells.
     """
-    par_clean = final_mse_median["fws_parallel"] < mse_clean_threshold
-    par_fidel = func_acc_median["fws_parallel"] >= func_threshold
-    hyp_clean = final_mse_median["fws_hyper"] < mse_clean_threshold
-    hyp_fidel = func_acc_median["fws_hyper"] >= func_threshold
+    low_l2 = loss < l2_clean_threshold
+    high_fidel = fidelity >= func_threshold
+    return f"{'low' if low_l2 else 'high'}_L2_{'high' if high_fidel else 'low'}_F"
 
-    if par_clean and par_fidel and hyp_clean and hyp_fidel:
-        return (
-            "**Both arms L2-fit cleanly AND clear functional fidelity ≥"
-            f" {func_threshold:.2f}.** Both architectures can represent "
-            "trained CIFAR weights — phase 6/8/9/10 task-loss failures "
-            "were training dynamics, not representation."
-        )
-    if par_clean and par_fidel and not (hyp_clean and hyp_fidel):
-        return (
-            "**FWS-parallel L2-fits and clears functional fidelity, "
-            "FWS-hyper does not.** The meta-renderer layer ($G_H$) "
-            "specifically breaks representation, not just optimisation. "
-            "The per-leaf parallel architecture *can* represent trained "
-            "weights."
-        )
-    if hyp_clean and hyp_fidel and not (par_clean and par_fidel):
-        return (
-            "**FWS-hyper L2-fits and clears functional fidelity, "
-            "FWS-parallel does not.** Surprising; would imply the "
-            "hyper-renderer is *more* expressive than the per-rank "
-            "parallel decomposition — inspect for a per-rank-G_leaf "
-            "expressivity ceiling."
-        )
-    return (
-        "**Neither arm clears the pre-registered combined "
-        "L2-fit + functional-fidelity bar.** The per-leaf "
-        "hyper-renderer family is the wrong shape for representing "
-        "real CIFAR networks; pivot programme architecture."
+
+def decide_interpretation(
+    raw_l2_median_per_cell: dict[str, dict[str, float]],
+    func_acc_median_per_cell: dict[str, dict[str, float]],
+    *, l2_clean_threshold: float, func_threshold: float,
+) -> str:
+    """Apply the 4-way pre-registered grid (per arm, per loss).
+
+    The verdict shape is:
+
+    - Per (arm, loss_kind) bucket out of {low_L2_high_F, low_L2_low_F,
+      high_L2_high_F, high_L2_low_F}.
+    - Cross-cell read for each arm: did the layer-wise cell rescue
+      fidelity (case 2 → case 1 / 2 → 3 distinction)?
+    - Cross-arm read: does the meta-renderer ($G_H$) specifically
+      break representation, or do both arms hit the same wall?
+
+    A robust pivot signal requires **both** arms to bucket as
+    ``high_L2_low_F`` under **both** losses.
+    """
+    cells = list(raw_l2_median_per_cell.keys())
+    arms_keys = list(raw_l2_median_per_cell[cells[0]].keys())
+
+    bucket: dict[tuple[str, str], str] = {}
+    for cell in cells:
+        for arm in arms_keys:
+            bucket[(cell, arm)] = _bucket(
+                raw_l2_median_per_cell[cell][arm],
+                func_acc_median_per_cell[cell][arm],
+                l2_clean_threshold=l2_clean_threshold,
+                func_threshold=func_threshold,
+            )
+
+    bucket_lines = [
+        f"- {arm} × {cell}: **{bucket[(cell, arm)]}**"
+        for arm in arms_keys for cell in cells
+    ]
+
+    all_pivot = all(bucket[(cell, arm)] == "high_L2_low_F"
+                    for arm in arms_keys for cell in cells)
+    layerwise_rescued = any(
+        bucket[("leaf_mean", arm)] in {"low_L2_low_F", "high_L2_low_F"}
+        and bucket[("layerwise_normalised", arm)] in {"low_L2_high_F", "high_L2_high_F"}
+        for arm in arms_keys
     )
+    parallel_only_fit = (
+        bucket.get(("layerwise_normalised", "fws_parallel"))
+        in {"low_L2_high_F", "high_L2_high_F"}
+        and bucket.get(("layerwise_normalised", "fws_hyper"))
+        in {"low_L2_low_F", "high_L2_low_F"}
+    )
+
+    if all_pivot:
+        verdict = (
+            "**Robust pivot signal: case 3 (high L2 + low fidelity) fires for "
+            "every (arm, loss) pair.** The per-leaf hyper-renderer family "
+            "cannot fit a trained CIFAR classifier's weight tree even when "
+            "the loss is layer-wise-normalised. Layer-wise normalisation does "
+            "not rescue fidelity, so NeRN/Schürholt brittleness is ruled out "
+            "as the explanation for the high-L2 failure. The per-leaf "
+            "hyper-renderer family is the wrong shape for representing real "
+            "CIFAR networks; pivot programme architecture."
+        )
+    elif layerwise_rescued and parallel_only_fit:
+        verdict = (
+            "**Layer-wise normalisation rescues FWS-parallel's functional "
+            "fidelity but not FWS-hyper's.** The per-rank parallel "
+            "architecture *can* represent trained CIFAR weights given a "
+            "Schürholt-balanced loss; the meta-renderer ($G_H$) breaks "
+            "representation specifically. Phase 6/8/9/10 FWS-parallel "
+            "failures were optimisation dynamics / loss-balancing, not "
+            "representation. FWS-hyper still pivot-signal."
+        )
+    elif layerwise_rescued:
+        verdict = (
+            "**Layer-wise normalisation rescues functional fidelity for at "
+            "least one arm.** NeRN/Schürholt brittleness was the dominant "
+            "failure mode under leaf-uniform L2. The architecture(s) that "
+            "fidelity-recover are expressive; phase 6/8/9/10 task-loss "
+            "failures for those arms were optimisation dynamics / loss "
+            "balancing, not representation."
+        )
+    else:
+        verdict = (
+            "**Mixed pattern.** Read the bucket table per (arm, loss). The "
+            "verdict is not the pre-registered robust pivot signal nor a "
+            "clean rescue; the result is hypothesis-generating, and the "
+            "next phase should isolate which (arm, loss) bucket carries "
+            "the signal."
+        )
+    return verdict + "\n\nPer-bucket verdict:\n" + "\n".join(bucket_lines)
+
+
+LOSS_KINDS: tuple[LossKind, ...] = ("leaf_mean", "layerwise_normalised")
 
 
 def main() -> None:
@@ -461,6 +620,7 @@ def main() -> None:
     train_x, train_y, test_x, test_y = data.load_cifar10()
     print(f"  train: {train_x.shape} | test: {test_x.shape}")
     print(f"  K_seed={K_SEED}, distill_steps={DISTILL_STEPS}, lr={DISTILL_LR}")
+    print(f"  loss kinds: {LOSS_KINDS}")
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -482,82 +642,120 @@ def main() -> None:
     for leaf, (a, r2) in target_alphas.items():
         print(f"    {leaf}: α={a:.3f} R²={r2:.3f}")
 
-    # --- Step 2: distill each FWS arm. -------------------------------------
+    # Per-leaf target std drives layerwise normalisation; print so the reader
+    # sees the relative magnitudes Schürholt's normalisation rebalances.
+    print("  target per-leaf std (drives layer-wise normalisation):")
+    for name in mainnet.LEAF_ORDER:
+        print(f"    {name}: std={float(np.asarray(target_W[name]).std()):.4e}")
+
     arms_order: list[arms.Arm] = [
         make_fws_hyper_distill_arm(),
         make_fws_parallel_distill_arm(),
     ]
-    final_mse: dict[str, list[float]] = {a.short: [] for a in arms_order}
-    per_leaf_l2_per_arm: dict[str, list[dict[str, float]]] = {a.short: [] for a in arms_order}
-    func_acc: dict[str, list[float]] = {a.short: [] for a in arms_order}
-    alphas_per_arm: dict[str, list[dict[str, tuple[float, float]]]] = {
-        a.short: [] for a in arms_order
-    }
-    trajectories: dict[str, list[list[tuple[int, float]]]] = {a.short: [] for a in arms_order}
-    rendered_per_arm_first_seed: dict[str, dict[str, np.ndarray]] = {}
 
+    # Per-cell × per-arm storage. trajectories[cell][arm] -> list of seed
+    # trajectories; same shape for final losses, per-leaf L2, fidelities, α.
+    final_loss: dict[str, dict[str, list[float]]] = {
+        cell: {a.short: [] for a in arms_order} for cell in LOSS_KINDS
+    }
+    per_leaf_l2: dict[str, dict[str, list[dict[str, float]]]] = {
+        cell: {a.short: [] for a in arms_order} for cell in LOSS_KINDS
+    }
+    func_acc: dict[str, dict[str, list[float]]] = {
+        cell: {a.short: [] for a in arms_order} for cell in LOSS_KINDS
+    }
+    alphas_per_cell: dict[str, dict[str, list[dict[str, tuple[float, float]]]]] = {
+        cell: {a.short: [] for a in arms_order} for cell in LOSS_KINDS
+    }
+    trajectories: dict[str, dict[str, list[list[tuple[int, float]]]]] = {
+        cell: {a.short: [] for a in arms_order} for cell in LOSS_KINDS
+    }
+
+    # --- Step 2: distill each (cell, arm) × K seeds. -----------------------
     distill_wall = 0.0
-    for a in arms_order:
-        print(f"\n--- Step 2: distill {a.name} (K={K_SEED}) ---")
-        for seed in range(K_SEED):
-            t_seed = time.time()
-            _state, traj, rendered = distill_arm(
-                a, target_W, seed=seed, num_steps=DISTILL_STEPS, lr=DISTILL_LR,
-            )
-            final = traj[-1][1]
-            leaf_l2 = per_leaf_l2(rendered, target_W)
-            tl, ta = eval_test_loss_acc(rendered, test_x, test_y)
-            alphas = diagnostics.per_leaf_alphas(rendered)
-            final_mse[a.short].append(final)
-            per_leaf_l2_per_arm[a.short].append(leaf_l2)
-            func_acc[a.short].append(ta)
-            alphas_per_arm[a.short].append(alphas)
-            trajectories[a.short].append(traj)
-            if seed == 0:
-                rendered_per_arm_first_seed[a.short] = rendered
-            seed_wall = time.time() - t_seed
-            distill_wall += seed_wall
-            print(f"  {a.short} seed {seed}: final_mse={final:.4e}  "
-                  f"func_acc={ta:.4f}  ({seed_wall:.1f}s)")
+    for cell in LOSS_KINDS:
+        for a in arms_order:
+            print(f"\n--- Step 2: distill {a.name}  [loss={cell}]  (K={K_SEED}) ---")
+            for seed in range(K_SEED):
+                t_seed = time.time()
+                _state, traj, rendered = distill_arm(
+                    a, target_W,
+                    seed=seed, num_steps=DISTILL_STEPS, lr=DISTILL_LR,
+                    loss_kind=cell,
+                )
+                final = traj[-1][1]
+                leaf_l2 = per_leaf_l2_sse(rendered, target_W)
+                _, ta = eval_test_loss_acc(rendered, test_x, test_y)
+                alphas = diagnostics.per_leaf_alphas(rendered)
+                final_loss[cell][a.short].append(final)
+                per_leaf_l2[cell][a.short].append(leaf_l2)
+                func_acc[cell][a.short].append(ta)
+                alphas_per_cell[cell][a.short].append(alphas)
+                trajectories[cell][a.short].append(traj)
+                seed_wall = time.time() - t_seed
+                distill_wall += seed_wall
+                print(f"  [{cell}] {a.short} seed {seed}: final_loss={final:.4e}  "
+                      f"func_acc={ta:.4f}  ({seed_wall:.1f}s)")
 
     # --- Step 3: numbers, figures, log. ------------------------------------
     print("\n--- Step 3: aggregate and write log ---")
-    summary_md = per_arm_summary_md(
-        arms_order, final_mse, per_leaf_l2_per_arm, func_acc, target_acc,
-    )
 
+    # Plots are cell-aware: side-by-side panels per cell.
     plot_distill_trajectories(
         trajectories, arms_order,
         FIGURES_DIR / "2026-06-07-phase11b-distill-trajectories.png",
-        title=f"Phase 11B — distillation MSE trajectories (K={K_SEED})",
+        title=f"Phase 11B — distillation loss trajectories (K={K_SEED})",
     )
     plot_functional_fidelity_box(
         func_acc, target_acc, arms_order,
         FIGURES_DIR / "2026-06-07-phase11b-functional-fidelity.png",
-        title=f"Phase 11B — functional fidelity (CIFAR test acc on distilled W, K={K_SEED})",
+        title=f"Phase 11B — functional fidelity per loss kind (K={K_SEED})",
     )
     plot_alpha_comparison(
-        target_alphas, alphas_per_arm, arms_order,
+        target_alphas, alphas_per_cell, arms_order,
         FIGURES_DIR / "2026-06-07-phase11b-alpha-comparison.png",
         title=f"Phase 11B — per-leaf α distilled vs target (K={K_SEED})",
     )
 
-    final_mse_median = {k: float(np.median(v)) for k, v in final_mse.items()}
-    func_acc_median = {k: float(np.median(v)) for k, v in func_acc.items()}
-    verdict_text = decide_interpretation(
-        final_mse_median, func_acc_median,
-        # MSE-clean threshold is heuristic: the leaf-mean MSE has the same
-        # order of magnitude as the leaf weights' variance under Kaiming init
-        # (~ 1 / fan_in). Calling MSE "clean" at <1e-2 says the rendered W
-        # is within an order of magnitude of init noise of the target W.
-        # The pre-registered call is on the COMBINATION; we surface this
-        # threshold explicitly so the reader sees the cut.
-        mse_clean_threshold=1e-2, func_threshold=0.40,
-    )
-    print("\nVerdict:")
-    print(f"  {verdict_text}")
+    # Per-cell summary + α tables.
+    cell_summaries: list[tuple[str, str]] = []
+    for cell in LOSS_KINDS:
+        s = per_arm_summary_md(
+            arms_order, final_loss[cell], per_leaf_l2[cell], func_acc[cell],
+            target_acc, cell_name=cell,
+        )
+        a = alpha_table_md(target_alphas, alphas_per_cell[cell], arms_order)
+        cell_summaries.append((cell, s + "\n\n#### Per-leaf α — " + cell + "\n\n" + a))
 
-    alpha_md = alpha_table_md(target_alphas, alphas_per_arm, arms_order)
+    # Pre-registered grid: bucket on RAW L2 (sum of squares, loss-kind
+    # independent), not the cell's training loss — so cells are commensurable.
+    raw_l2_median_per_cell: dict[str, dict[str, float]] = {
+        cell: {
+            arm: float(np.median([
+                sum(d.values()) for d in per_leaf_l2[cell][arm]
+            ]))
+            for arm in [a.short for a in arms_order]
+        }
+        for cell in LOSS_KINDS
+    }
+    func_acc_median_per_cell: dict[str, dict[str, float]] = {
+        cell: {arm: float(np.median(v)) for arm, v in func_acc[cell].items()}
+        for cell in LOSS_KINDS
+    }
+    verdict_text = decide_interpretation(
+        raw_l2_median_per_cell, func_acc_median_per_cell,
+        # Raw-L2 "clean" threshold: 1e-1 on the sum-of-squares across leaves.
+        # The target's sum-of-squares ‖W*‖² is ~5.5e+02 dominated by fc1;
+        # an L2 of < 1e-1 corresponds to <0.02% relative error.
+        # Heuristic, surfaced for the reader.
+        l2_clean_threshold=1e-1, func_threshold=0.40,
+    )
+    print("\nVerdict:\n" + verdict_text)
+
+    # Compose log sections.
+    step2_section_body = "\n\n".join(
+        f"### Cell — {cell}\n\n{body}" for cell, body in cell_summaries
+    )
 
     sections: list[tuple[str, str]] = [
         ("Background", _BACKGROUND_MD),
@@ -572,19 +770,22 @@ def main() -> None:
             f"target wall {target_wall:.1f}s).\n\n"
             "Per-epoch checkpoints:\n\n| epoch | test loss | test acc |\n|---|---|---|\n"
             + "\n".join(f"| {e} | {tl:.4f} | {ta:.4f} |" for e, tl, ta in target_ckpts)
+            + "\n\nPer-leaf target std (drives layer-wise normalisation):\n\n"
+            "| leaf | std |\n|---|---|\n"
+            + "\n".join(
+                f"| {name} | {float(np.asarray(target_W[name]).std()):.4e} |"
+                for name in mainnet.LEAF_ORDER
+            )
         )),
-        (f"Step 2 — L2 distillation (K={K_SEED} per arm)", (
-            summary_md + "\n\n"
-            "![distillation trajectories](figures/2026-06-07-phase11b-distill-trajectories.png)\n\n"
-            "![functional fidelity (CIFAR test acc on distilled W)]"
-            "(figures/2026-06-07-phase11b-functional-fidelity.png)"
-        )),
-        ("Step 3 — per-leaf α distilled vs target", (
-            alpha_md + "\n\n"
-            "![per-leaf α distilled vs target]"
-            "(figures/2026-06-07-phase11b-alpha-comparison.png)"
-        )),
-        ("Interpretation (pre-registered rule firing)", verdict_text),
+        (f"Step 2 — L2 distillation, two-cell grid (K={K_SEED} per (arm, loss))",
+         step2_section_body + "\n\n"
+         "![distillation trajectories per cell]"
+         "(figures/2026-06-07-phase11b-distill-trajectories.png)\n\n"
+         "![functional fidelity per cell]"
+         "(figures/2026-06-07-phase11b-functional-fidelity.png)\n\n"
+         "![per-leaf α distilled vs target per cell]"
+         "(figures/2026-06-07-phase11b-alpha-comparison.png)"),
+        ("Interpretation (4-way grid, per arm × per loss)", verdict_text),
         ("Honest caveats", _CAVEATS_MD.format(
             k_seed=K_SEED, target_epochs=TARGET_EPOCHS,
             distill_steps=DISTILL_STEPS, distill_wall=distill_wall,
@@ -616,63 +817,91 @@ end-to-end, and FWS-parallel only got off chance at phase 10
 
 Phase 11B disambiguates by **direct L2 distillation against a fixed
 target weight tree.** No task loss enters the FWS arm's optimisation.
-If the FWS arm can fit a known-good $W^{\\star}$ by L2, then the family
-*can* express trained weights; the previous failures were
-training-dynamics. If it cannot fit $W^{\\star}$ even by L2, the family
-is the wrong shape.
+
+**Literature anchoring.** NeRN (Ashkenazi et al., arXiv:2212.13554,
+2023) is the direct prior art for this diagnostic: a coordinate→weight
+predictor trained by L2 distillation against a fixed CIFAR/ImageNet
+classifier, with explicit accuracy-preservation evaluation. Phase 11B
+largely replicates NeRN's setup. The fws-bench novelty axis is
+**sine-only SIREN backbone + polar projection $P$ on the latent** —
+NeRN uses an MLP and imposes no geometric constraint on the latent.
+
+Both NeRN AND Schürholt et al. (Hyper-Representations,
+arXiv:2209.14733, 2022) report a known failure mode of leaf-uniform
+L2: low MSE, near-zero task accuracy, because weight distributions
+vary by 1–2 OoM across layer types (fc ∼ 0.1, conv ∼ 0.01, bias ≈ 0).
+Uniform L2 underweights small-std layers; small absolute perturbations
+to those layers destroy classification accuracy. Schürholt's fix is
+**layer-wise normalisation**: scale each leaf's contribution to the
+loss by its target's variance. Phase 11B runs both losses as paired
+cells so the verdict reads off a 4-way grid, not from a single number.
 """
 
 _SETUP_MD = """
 1. Train a vanilla ``WideKernelCNN-SiLU`` on CIFAR-10 with Adam(1e-3)
    for {target_epochs} epochs. Save the trained weights as $W^{{\\star}}$.
+   No smoothness regulariser on $W^{{\\star}}$ (NeRN imposes one; we
+   leave it off for the first-pass diagnostic).
 2. For each FWS arm in {{FWS-hyper-polar (full phase 10 architecture:
    $G_H$ SIREN body + linear readout + per-leaf $G_H$ output
    normalisation + Kaiming pre-factor + polar Newton-Schulz $P$),
    FWS-parallel-no-G_H + polar $P$}}, train the FWS state via
-   Adam({distill_lr}) to minimise
-   $\\sum_{{\\ell}} \\text{{mean}}((W_{{\\ell}}(\\text{{state}}) -
-   W^{{\\star}}_{{\\ell}})^2)$ for {distill_steps} outer steps. K={k_seed}.
-3. Measure per-leaf $\\|W_{{\\text{{rendered}}}} - W^{{\\star}}\\|^2$,
+   Adam({distill_lr}) for {distill_steps} outer steps under each of two
+   losses (paired cells; K={k_seed} per cell):
+
+   - **leaf-mean**: $\\sum_{{\\ell}} \\text{{mean}}((W_{{\\ell}}(\\text{{state}}) -
+     W^{{\\star}}_{{\\ell}})^2)$ — leaf-uniform; NeRN's default shape.
+   - **layer-wise normalised** (Schürholt 2022): each leaf's mean
+     squared error is divided by $\\text{{var}}(W^{{\\star}}_{{\\ell}})$,
+     so each leaf contributes proportionally to its native magnitude.
+
+3. Measure raw per-leaf $\\|W_{{\\text{{rendered}}}} - W^{{\\star}}\\|^2$
+   (sum-of-squares, loss-kind independent — comparable across cells),
    functional fidelity (test accuracy of the distilled rendered $W$ on
    CIFAR-10), and per-leaf HT-SR / radial-FFT $\\alpha$ comparison.
 
-Pre-registered interpretation rules (combination on L2-clean fit AND
-functional fidelity, not L2 alone):
+**Pre-registered 4-way grid (per arm, per loss):**
 
-- **FWS-parallel clean AND fidelity ≥ 0.40 AND FWS-hyper not** →
-  the meta-renderer layer specifically breaks representation.
-- **Both clean AND fidelity ≥ 0.40** → training dynamics, not
-  representation, drove the failures.
-- **Neither clean** → wrong family; pivot.
-- **FWS-hyper clean AND parallel not** → surprising;
-  per-rank-G_leaf expressivity ceiling.
+1. *low L2 + high fidelity (≥ 0.40)* — architecture both represents
+   the target and preserves its function. Clean positive.
+2. *low L2 + low fidelity* — NeRN/Schürholt brittleness; check the
+   layer-wise cell. If layer-wise rescues fidelity, the architecture
+   is expressive and phase 6/8/9/10 failures were optimisation
+   dynamics / loss balancing.
+3. *high L2 + low fidelity* — architecture cannot fit the target.
+   If both arms × both losses fire case 3, robust pivot signal.
+4. *high L2 + high fidelity* — implausible; instrumentation bug.
 
-L2-clean threshold for rule firing: total leaf-summed MSE < $10^{{-2}}$
-(soft heuristic; the verdict reads numbers and trajectory in the
-combination, per brief).
+L2-clean threshold for the bucket call: raw sum-of-squares
+$\\sum_{{\\ell}} \\|W_{{\\ell}} - W^{{\\star}}_{{\\ell}}\\|^2 < 0.1$
+(soft heuristic; verbatim numbers are the primary artefact).
 """
 
 _CAVEATS_MD = """
 - **K={k_seed} smoke** — not K=10 confirmation.
 - **One target tree.** A single Adam(1e-3) × {target_epochs}-epoch run
   produced $W^{{\\star}}$. Different target weights (different init,
-  different LR, longer training) might be easier or harder to
-  L2-fit; this phase reports the K={k_seed} numbers against one
-  $W^{{\\star}}$.
-- **L2 "clean" threshold is a soft heuristic.** The brief explicitly
-  declines a pre-committed L2 number — the verdict reads the L2
-  trajectory + functional fidelity in combination. We surface a
-  threshold ($10^{{-2}}$) only for the boolean interpretation-rule
-  firing; the verbatim L2 numbers are the primary artefact.
+  different LR, longer training, or NeRN's smoothness regulariser)
+  might be easier or harder to L2-fit; this phase reports the
+  K={k_seed} numbers against one un-regularised $W^{{\\star}}$.
+- **L2 "clean" threshold is a soft heuristic.** The bucket call uses
+  a raw sum-of-squares < 0.1 cut for case-3 detection; the verbatim
+  per-cell loss values and the raw per-leaf L2 numbers are the primary
+  artefacts.
 - **Distillation may exit at a local minimum of the rendering manifold.**
   If the FWS arm hits a flat region of the rendering function near
   $W^{{\\star}}$, the L2 stalls but the family could still in
-  principle express $W^{{\\star}}$. We mitigate by running
-  {distill_steps} steps; a STOP at the loss-trajectory plateau is a
-  representation-side ceiling under the schedule, not a hard
-  expressivity bound.
+  principle express $W^{{\\star}}$. {distill_steps} steps is the
+  budget; the loss-trajectory plateau is a representation-side
+  ceiling under the schedule, not a hard expressivity bound.
+- **Bias-leaf variance can be near zero**, which would blow up the
+  layer-wise weight $1 / \\text{{var}}$. We add
+  ``eps = finfo(dtype).eps * leaf.size`` to var as a numerical
+  guard; the resulting bias weights are bounded but large enough
+  that bias L2 dominates the layer-wise loss early. The plateau is
+  the diagnostic of interest, not the early-step shape.
 - **No data augmentation, no LR schedule.** Plain Adam(1e-3).
-- **Distillation wall**: {distill_wall:.1f}s.
+- **Distillation wall (all cells, all seeds)**: {distill_wall:.1f}s.
 """
 
 
