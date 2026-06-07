@@ -394,6 +394,9 @@ def per_seed_diagnostics(seed: int, states: dict, final_Ws: dict[str, dict[str, 
             grad_fn, W, k=SIGMA_TOP_K, num_iterations=HESSIAN_POWER_ITERS,
             key=jax.random.key(11)))[0])
 
+    # Per-leaf α (HT-SR for fc, radial-FFT for conv) at convergence.
+    alphas = {short: diagnostics.per_leaf_alphas(W) for short, W in final_Ws.items()}
+
     return {
         "sigma_z_hyper": sigma_z_hyper,
         "sigma_gh_hyper": sigma_gh_hyper,
@@ -401,6 +404,7 @@ def per_seed_diagnostics(seed: int, states: dict, final_Ws: dict[str, dict[str, 
         "g_leaf_cosines": g_leaf_cosines,
         "g_leaf_params": g_leaf_params,
         **{f"hess_{k}": v for k, v in hess.items()},
+        **{f"{short}_alphas": alpha_dict for short, alpha_dict in alphas.items()},
     }
 
 
