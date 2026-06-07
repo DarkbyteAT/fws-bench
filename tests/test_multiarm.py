@@ -133,6 +133,49 @@ def test_per_seed_diagnostics_callback_merged_into_row():
     assert per_seed[1]["sentinel"] == 10
 
 
+def test_arm_diagnostics_at_convergence_namespaced_under_short():
+    # Given: two arms, each with its own diagnostics_at_convergence callback
+    # that returns leaf-keyed dicts. The harness should merge each return
+    # under "{arm.short}.<key>" namespaces so two arms never collide on the
+    # same dict key.
+    arm_a = _linear_arm("A", "a")
+    arm_b = _linear_arm("B", "b")
+
+    def diag_a(state, eval_batch):
+        return {"alphas": {"leaf": (1.0, 0.9)}, "norm": float(jnp.linalg.norm(state["W"]))}
+
+    def diag_b(state, eval_batch):
+        return {"alphas": {"leaf": (2.0, 0.5)}}
+
+    arm_a = fws_bench.Arm(
+        name=arm_a.name, short=arm_a.short, color=arm_a.color,
+        init=arm_a.init, loss_fn=arm_a.loss_fn, render_W=arm_a.render_W,
+        optimiser=arm_a.optimiser, diagnostics_at_convergence=diag_a,
+    )
+    arm_b = fws_bench.Arm(
+        name=arm_b.name, short=arm_b.short, color=arm_b.color,
+        init=arm_b.init, loss_fn=arm_b.loss_fn, render_W=arm_b.render_W,
+        optimiser=arm_b.optimiser, diagnostics_at_convergence=diag_b,
+    )
+    x, y = _toy_dataset(n=32)
+
+    # When: we run K=1 with the two arms wired up.
+    per_seed, _, _ = fws_bench.paired_train_4arm(
+        arms=[arm_a, arm_b],
+        train_x=x, train_y=y,
+        eval_fn=lambda W: (0.0, 0.0), predict_fn=lambda W: np.zeros(4, dtype=np.int32),
+        num_epochs=1, K_seed=1, batch_size=8,
+        diagnostics_batch_size=8,
+    )
+
+    # Then: each arm's diagnostic keys live under its own namespace.
+    row = per_seed[0]
+    assert row["a.alphas"]["leaf"] == (1.0, 0.9)
+    assert row["b.alphas"]["leaf"] == (2.0, 0.5)
+    assert "a.norm" in row
+    assert "b.norm" not in row
+
+
 def test_nan_in_loss_trajectory_logged():
     # Given: an arm whose loss is always NaN.
     def init(key):

@@ -167,19 +167,25 @@ def _all_test_preds(params: dict[str, Array], test_x: np.ndarray) -> np.ndarray:
 
 
 # --- Build arms (phase 10's Kaiming remap is OFF in phase 8) ---------------
-def make_fws_hyper_arm(out_scale_kind: str = "existing") -> arms.Arm:
+def make_fws_hyper_arm(
+    out_scale_kind: str = "existing",
+    *,
+    diagnostics_at_convergence=None,
+) -> arms.Arm:
     return arms.make_fws_hyper(
         g_h_init=lambda key: HyperRenderer(key=key, out_scale_kind=out_scale_kind),
         leaf_scale_fn=None,
+        diagnostics_at_convergence=diagnostics_at_convergence,
     )
 
 
 def make_arms_list() -> list[arms.Arm]:
     return [
-        make_fws_hyper_arm("existing"),
-        arms.make_fws_parallel(),
-        arms.make_w_matched(),
-        arms.make_w_overparam(),
+        make_fws_hyper_arm("existing",
+                           diagnostics_at_convergence=_fws_hyper_diagnostics),
+        arms.make_fws_parallel(diagnostics_at_convergence=_fws_parallel_diagnostics),
+        arms.make_w_matched(diagnostics_at_convergence=_w_arm_diagnostics),
+        arms.make_w_overparam(diagnostics_at_convergence=_w_overparam_diagnostics),
     ]
 
 
@@ -209,57 +215,62 @@ def sigma_at_z_parallel(state: dict) -> Array:
                              key=jax.random.key(7))
 
 
-# --- Per-seed phase-specific diagnostics callback ---------------------------
-def per_seed_diagnostics(seed: int, states: dict, final_Ws: dict[str, dict[str, Array]]) -> dict:
-    """Compute σ-spectra, Hessian top-eigs, G_leaf cosines + params at convergence."""
-    rng = np.random.default_rng(seed)
-    fws_state = states["fws_hyper"]
-    par_state = states["fws_parallel"]
+# --- Per-arm diagnostics callbacks ------------------------------------------
+def _hessian_top_eig(W: dict, eval_batch: dict) -> float:
+    grad_fn = jax.grad(lambda p: mainnet.cross_entropy_loss(p, eval_batch))
+    return float(np.asarray(singular_spectrum(
+        grad_fn, W, k=SIGMA_TOP_K, num_iterations=HESSIAN_POWER_ITERS,
+        key=jax.random.key(11)))[0])
 
-    sigma_z_hyper = np.asarray(sigma_at_z_hyper(fws_state))
-    sigma_gh_hyper = np.asarray(sigma_at_gh_hyper(fws_state))
-    sigma_z_par = np.asarray(sigma_at_z_parallel(par_state))
 
-    g_leaf_cosines = diagnostics.g_leaf_cosine_matrix(
-        fws_state["G"].produce_flat, fws_state["z"],
-    )
-    g_leaf_params = {
-        name: {
-            k: np.asarray(v) for k, v in
-            fws_state["G"].produce(fws_state["z"], mainnet.LEAF_ORDER.index(name), mainnet.LEAF_RANKS[name]).items()
-        }
-        for name in mainnet.LEAF_ORDER
-    }
-
-    hess: dict[str, float] = {}
-    train_x_l = _shared_train_x
-    train_y_l = _shared_train_y
-    hess_idx = rng.choice(train_x_l.shape[0], size=EVAL_HESS_BATCH, replace=False)
-    hess_batch = {"x": jnp.asarray(train_x_l[hess_idx]), "y": jnp.asarray(train_y_l[hess_idx])}
-    for short, W in final_Ws.items():
-        grad_fn = jax.grad(lambda p, b=hess_batch: mainnet.cross_entropy_loss(p, b))
-        hess[short] = float(np.asarray(singular_spectrum(
-            grad_fn, W, k=SIGMA_TOP_K, num_iterations=HESSIAN_POWER_ITERS,
-            key=jax.random.key(11)))[0])
-
+def _fws_hyper_diagnostics(state: dict, eval_batch: dict) -> dict:
+    W = _HYPER_RENDER(state)
     return {
-        "sigma_z_hyper": sigma_z_hyper,
-        "sigma_gh_hyper": sigma_gh_hyper,
-        "sigma_z_par": sigma_z_par,
-        "g_leaf_cosines": g_leaf_cosines,
-        "g_leaf_params": g_leaf_params,
-        **{f"hess_{k}": v for k, v in hess.items()},
+        "alphas": diagnostics.per_leaf_alphas({k: np.asarray(v) for k, v in W.items()}),
+        "sigma_z": np.asarray(sigma_at_z_hyper(state)),
+        "sigma_gh": np.asarray(sigma_at_gh_hyper(state)),
+        "g_leaf_cosines": diagnostics.g_leaf_cosine_matrix(
+            state["G"].produce_flat, state["z"],
+        ),
+        "g_leaf_params": {
+            name: {
+                k: np.asarray(v) for k, v in
+                state["G"].produce(
+                    state["z"], mainnet.LEAF_ORDER.index(name), mainnet.LEAF_RANKS[name],
+                ).items()
+            }
+            for name in mainnet.LEAF_ORDER
+        },
+        "hess": _hessian_top_eig(W, eval_batch),
     }
 
 
-# --- Module-level train cache (set up in main(), used by per_seed_diagnostics)
-_shared_train_x: np.ndarray
-_shared_train_y: np.ndarray
+def _fws_parallel_diagnostics(state: dict, eval_batch: dict) -> dict:
+    W = _PARALLEL_RENDER(state)
+    return {
+        "alphas": diagnostics.per_leaf_alphas({k: np.asarray(v) for k, v in W.items()}),
+        "sigma_z": np.asarray(sigma_at_z_parallel(state)),
+        "hess": _hessian_top_eig(W, eval_batch),
+    }
+
+
+def _w_arm_diagnostics(state: dict, eval_batch: dict) -> dict:
+    return {
+        "alphas": diagnostics.per_leaf_alphas({k: np.asarray(v) for k, v in state.items()}),
+        "hess": _hessian_top_eig(state, eval_batch),
+    }
+
+
+def _w_overparam_diagnostics(model, eval_batch: dict) -> dict:
+    W = model.materialise()
+    return {
+        "alphas": diagnostics.per_leaf_alphas({k: np.asarray(v) for k, v in W.items()}),
+        "hess": _hessian_top_eig(W, eval_batch),
+    }
 
 
 # --- Main --------------------------------------------------------------------
 def main() -> None:
-    global _shared_train_x, _shared_train_y
     stage = os.environ.get("PHASE8_STAGE", "all")
 
     print("=" * 72)
@@ -269,7 +280,6 @@ def main() -> None:
     train_x, train_y, test_x, test_y = data.load_cifar10()
     raw_test_x = data.load_raw_test()
     print(f"  train: {train_x.shape} {train_y.shape} | test: {test_x.shape} {test_y.shape}")
-    _shared_train_x, _shared_train_y = train_x, train_y
 
     arms_list = make_arms_list()
 
@@ -325,7 +335,7 @@ def main() -> None:
                 predict_fn=lambda W: _all_test_preds(W, test_x),
                 num_epochs=EPOCHS, K_seed=K_SEED,
                 batch_size=BATCH_SIZE,
-                per_seed_diagnostics=per_seed_diagnostics,
+                diagnostics_batch_size=EVAL_HESS_BATCH,
             )
 
     # ---- Plots + research log ----------------------------------------------
@@ -358,9 +368,9 @@ def main() -> None:
             FIGURES_DIR / "2026-06-07-phase8-jacobian-spectrum.png",
             title=f"Phase 8 — Jacobian σ-spectrum at final, top-{SIGMA_TOP_K} (K={K_SEED})",
             sigma_keys={
-                "hyper: σ(∂render/∂z)": "sigma_z_hyper",
-                "hyper: σ(∂render/∂G_H)": "sigma_gh_hyper",
-                "parallel: σ(∂render/∂z)": "sigma_z_par",
+                "hyper: σ(∂render/∂z)": "fws_hyper.sigma_z",
+                "hyper: σ(∂render/∂G_H)": "fws_hyper.sigma_gh",
+                "parallel: σ(∂render/∂z)": "fws_parallel.sigma_z",
             },
         )
         for a in arms_list:

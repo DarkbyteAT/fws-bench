@@ -207,7 +207,11 @@ W_OVERPARAM_COLOUR = WONG[3]        # bluish-green
 
 
 # --- The three shared arms -------------------------------------------------
-def make_w_matched(*, lr: float = 1e-3) -> Arm:
+def make_w_matched(
+    *,
+    lr: float = 1e-3,
+    diagnostics_at_convergence: Callable[[Any, dict], dict[str, Any]] | None = None,
+) -> Arm:
     """Direct WideKernelCNN-SiLU init + cross-entropy + Adam."""
     return Arm(
         name="W matched",
@@ -217,10 +221,15 @@ def make_w_matched(*, lr: float = 1e-3) -> Arm:
         loss_fn=mainnet.cross_entropy_loss,
         render_W=lambda params: params,
         optimiser=optax.adam(lr),
+        diagnostics_at_convergence=diagnostics_at_convergence,
     )
 
 
-def make_w_overparam(*, lr: float = 1e-3) -> Arm:
+def make_w_overparam(
+    *,
+    lr: float = 1e-3,
+    diagnostics_at_convergence: Callable[[Any, dict], dict[str, Any]] | None = None,
+) -> Arm:
     """Factored (rank-P) CNN + cross-entropy on materialised W + Adam."""
 
     def init(key: Array) -> mainnet.OverparamCNN:
@@ -237,6 +246,7 @@ def make_w_overparam(*, lr: float = 1e-3) -> Arm:
         loss_fn=loss_fn,
         render_W=lambda model: model.materialise(),
         optimiser=optax.adam(lr),
+        diagnostics_at_convergence=diagnostics_at_convergence,
     )
 
 
@@ -246,6 +256,7 @@ def make_fws_parallel(
     projection_fn: Callable[[Array, str], Array] | None = None,
     lr: float = 1e-3,
     z_init_std: float = 0.1,
+    diagnostics_at_convergence: Callable[[Any, dict], dict[str, Any]] | None = None,
 ) -> Arm:
     """FWS-parallel-no-G_H arm: three rank-keyed ``G_leaf``s + per-rank FiLM.
 
@@ -298,6 +309,7 @@ def make_fws_parallel(
         loss_fn=loss_fn,
         render_W=render,
         optimiser=optax.adam(lr),
+        diagnostics_at_convergence=diagnostics_at_convergence,
     )
 
 
@@ -312,6 +324,7 @@ def make_fws_hyper(
     z_init_std: float = 0.1,
     name: str = "FWS-hyper",
     short: str = "fws_hyper",
+    diagnostics_at_convergence: Callable[[Any, dict], dict[str, Any]] | None = None,
 ) -> Arm:
     """Construct the FWS-hyper arm given a phase-specific ``G_H`` initializer.
 
@@ -371,6 +384,7 @@ def make_fws_hyper(
         loss_fn=loss_fn,
         render_W=render,
         optimiser=optimiser,
+        diagnostics_at_convergence=diagnostics_at_convergence,
     )
 
 

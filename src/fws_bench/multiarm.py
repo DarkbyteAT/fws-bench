@@ -53,6 +53,13 @@ class Arm:
       partitioned arms (e.g. FWS-hyper with separate G / z optimisers)
       use :func:`optax.multi_transform` to build the partition before
       constructing the Arm.
+    - ``diagnostics_at_convergence`` — optional
+      ``(state, eval_batch) -> dict[str, Any]`` invoked once per seed
+      after training. The returned dict's keys are auto-namespaced under
+      ``"{arm.short}."`` in the per-seed result row (e.g. ``"alphas"`` →
+      ``"fws_hyper.alphas"``). Lets each arm own its own diagnostic
+      computation without phase code reaching into ``states[short]`` by
+      string key.
     """
 
     name: str
@@ -62,6 +69,7 @@ class Arm:
     loss_fn: Callable[[Any, PyTree], Array]
     render_W: Callable[[Any], PyTree]
     optimiser: optax.GradientTransformation
+    diagnostics_at_convergence: Callable[[Any, dict], dict[str, Any]] | None = None
 
 
 def _global_l2_norm(grad_tree: PyTree) -> Array:
@@ -114,6 +122,7 @@ def paired_train_4arm(
     batch_size: int = 128,
     log_every: int = 100,
     per_seed_diagnostics: PerSeedDiagnosticsFn | None = None,
+    diagnostics_batch_size: int = 1024,
 ) -> tuple[list[dict], list[str], float]:
     """Run every arm on the same batch sequence for ``K_seed`` seeds.
 
@@ -142,6 +151,10 @@ def paired_train_4arm(
         per_seed_diagnostics: optional ``(seed, arm_states, rendered_W_per_arm)
             -> dict``. Result dict is merged into the seed's row before
             being appended to the output list.
+        diagnostics_batch_size: size of the random subsample drawn from
+            ``(train_x, train_y)`` per seed and passed as ``eval_batch``
+            to each arm's :attr:`Arm.diagnostics_at_convergence`
+            callback. Ignored when no arm defines that callback.
 
     Returns:
         ``(per_seed_results, nan_or_crash_log, wall_clock_seconds)``.
@@ -173,6 +186,7 @@ def paired_train_4arm(
                 batch_size=batch_size,
                 log_every=log_every,
                 per_seed_diagnostics=per_seed_diagnostics,
+                diagnostics_batch_size=diagnostics_batch_size,
             )
             per_seed.append(row)
             if row["any_nan"]:
@@ -198,6 +212,7 @@ def _run_seed(
     batch_size: int,
     log_every: int,
     per_seed_diagnostics: PerSeedDiagnosticsFn | None,
+    diagnostics_batch_size: int,
 ) -> dict:
     key = jax.random.key(seed)
     keys = jax.random.split(key, len(arms))
@@ -257,6 +272,23 @@ def _run_seed(
         row[f"{a.short}_test_preds"] = final_preds[a.short]
         row[f"{a.short}_W"] = {k: np.asarray(v) for k, v in final_Ws[a.short].items()}
         row[f"final_{a.short}_acc"] = float(ckpts[a.short][-1][2])
+
+    needs_eval_batch = any(a.diagnostics_at_convergence is not None for a in arms)
+    if needs_eval_batch:
+        rng_diag = np.random.default_rng(seed)
+        diag_idx = rng_diag.choice(
+            n_train, size=min(diagnostics_batch_size, n_train), replace=False,
+        )
+        eval_batch = {
+            "x": jnp.asarray(train_x[diag_idx]),
+            "y": jnp.asarray(train_y[diag_idx]),
+        }
+        for a in arms:
+            if a.diagnostics_at_convergence is None:
+                continue
+            arm_extras = a.diagnostics_at_convergence(states[a.short], eval_batch)
+            for k, v in arm_extras.items():
+                row[f"{a.short}.{k}"] = v
 
     if per_seed_diagnostics is not None:
         extras = per_seed_diagnostics(seed, states, final_Ws)

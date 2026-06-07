@@ -105,10 +105,20 @@ def plot_acc_trajectories(
 
 # --- α boxplots -------------------------------------------------------------
 def _alpha_panel(ax, per_seed: list[dict], arms_list: list[Arm], leaf: str, title: str) -> None:
-    data = [[r[f"{a.short}_alphas"][leaf][0] for r in per_seed] for a in arms_list]
-    labels = [_short_label(a.name) for a in arms_list]
+    # Per-arm α dicts live under "{arm.short}.alphas" — set by the arm's
+    # diagnostics_at_convergence callback. Arms with no callback are
+    # silently skipped so the rest of the panel still renders.
+    arms_with_alphas = [
+        a for a in arms_list
+        if all(f"{a.short}.alphas" in r and leaf in r[f"{a.short}.alphas"] for r in per_seed)
+    ]
+    if not arms_with_alphas:
+        ax.set_title(f"{title} — no α data", fontsize=10)
+        return
+    data = [[r[f"{a.short}.alphas"][leaf][0] for r in per_seed] for a in arms_with_alphas]
+    labels = [_short_label(a.name) for a in arms_with_alphas]
     bp = ax.boxplot(data, patch_artist=True, widths=0.55, showfliers=False, tick_labels=labels)
-    cols = [a.color for a in arms_list]
+    cols = [a.color for a in arms_with_alphas]
     for patch, c in zip(bp["boxes"], cols, strict=True):
         patch.set_facecolor(c)
         patch.set_alpha(0.35)
@@ -371,11 +381,12 @@ def plot_fws_g_leaf_panel(
     *,
     title: str,
     hidden_dim: int,
+    arm_short: str = "fws_hyper",
 ) -> None:
     """Heatmaps of (W_in, W_h, W_out) for each leaf at the FWS-hyper median seed."""
-    rep = _select_reps(per_seed, "final_fws_hyper_acc")
+    rep = _select_reps(per_seed, f"final_{arm_short}_acc")
     chosen = rep["median"]
-    g_leaf = chosen["g_leaf_params"]
+    g_leaf = chosen[f"{arm_short}.g_leaf_params"]
 
     n_leaves = len(mainnet.LEAF_ORDER)
     fig, axes = plt.subplots(n_leaves, 3, figsize=(7.5, 1.0 * n_leaves + 0.5))
@@ -406,11 +417,12 @@ def plot_g_leaf_cosine(
     save_path: Path,
     *,
     title: str,
+    arm_short: str = "fws_hyper",
 ) -> None:
     """Pairwise cosine between FWS-hyper's per-leaf flat G_leaf params."""
-    rep = _select_reps(per_seed, "final_fws_hyper_acc")
+    rep = _select_reps(per_seed, f"final_{arm_short}_acc")
     chosen = rep["median"]
-    M = chosen["g_leaf_cosines"]
+    M = chosen[f"{arm_short}.g_leaf_cosines"]
     n_leaves = len(mainnet.LEAF_ORDER)
     fig, ax = plt.subplots(figsize=(6.0, 5.2))
     im = ax.imshow(M, vmin=-1.0, vmax=1.0, cmap="RdBu_r")
