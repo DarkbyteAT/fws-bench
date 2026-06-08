@@ -1,6 +1,6 @@
 [project]
 name = "fws-bench"
-version = "0.0.0"
+version = "0.2.0"
 description = "Experimental orchestration for the FWS programme: z-space vs W-space paired training, optimisation regime sweeps, ablation runners"
 readme = "README.md"
 license = "MIT"
@@ -31,6 +31,7 @@ dependencies = [
     "landscape-archaeology",
     "ondes",
     "loom",
+    "scikit-image>=0.26.0",
 ]
 
 [tool.uv.sources]
